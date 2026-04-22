@@ -9,6 +9,10 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
@@ -21,6 +25,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
+import androidx.core.graphics.toColorInt
 import androidx.core.net.toUri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -36,12 +41,12 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.material3.Text
@@ -55,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.URLUtil
@@ -63,11 +69,31 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
+
+/** Chromium reports this when a load is superseded by a new navigation (not a real outage). */
+private fun isCanceledNavigationError(description: CharSequence?): Boolean {
+    if (description.isNullOrBlank()) return false
+    val s = description.toString()
+    return s.contains("ERR_ABORTED", ignoreCase = true) ||
+        s.contains("ERR_CANCELED", ignoreCase = true)
+}
+
+@Suppress("DEPRECATION")
+private fun applyShopWebViewColorPolicy(settings: WebSettings) {
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+        WebSettingsCompat.setForceDark(settings, WebSettingsCompat.FORCE_DARK_OFF)
+    }
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+        WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false)
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,7 +145,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@SuppressLint("SetJavaScriptEnabled")
+@SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
 fun ShopWebView(
     url: String,
@@ -130,6 +156,8 @@ fun ShopWebView(
 ) {
     val context = LocalContext.current
     var isLoading by remember { mutableStateOf(true) }
+    /** After the first successful paint, we stop the full-screen loader on navigations (avoids flicker). */
+    var initialWebPaintDone by remember { mutableStateOf(false) }
     var hasError by remember { mutableStateOf(false) }
     var retryTick by remember { mutableIntStateOf(0) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
@@ -178,6 +206,7 @@ fun ShopWebView(
     }
 
     val allowedHosts = remember { setOf("127.0.0.1", "localhost") }
+    val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
 
     // Reliable completion check for the most recent app-started download.
     LaunchedEffect(pendingDownloadId) {
@@ -246,21 +275,9 @@ fun ShopWebView(
         }
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
-        // Non-consuming touch listener to track user activity for idle reload.
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(Unit) {
-                    while (true) {
-                        awaitPointerEventScope {
-                            awaitPointerEvent()
-                            lastInteractionMs = System.currentTimeMillis()
-                        }
-                    }
-                }
-        )
-
+    // Match shop portal so any gap between WebView paints is not pure black.
+    val portalBg = Color("#252b23".toColorInt())
+    Box(modifier = modifier.fillMaxSize().background(portalBg)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
@@ -270,6 +287,22 @@ fun ShopWebView(
                     settings.useWideViewPort = true
                     settings.loadWithOverviewMode = true
                     settings.mediaPlaybackRequiresUserGesture = false
+                    applyShopWebViewColorPolicy(settings)
+                    // Shopkasse --kas-bg-mid (WebView clears to this between full navigations).
+                    setBackgroundColor("#252b23".toColorInt())
+                    // Do not call performClick() here: on WebView it can fire an extra accessibility
+                    // "click" and accidentally activate header links (e.g. "/" → admin session cleared).
+                    setOnTouchListener { _, e ->
+                        when (e.actionMasked) {
+                            MotionEvent.ACTION_DOWN,
+                            MotionEvent.ACTION_MOVE,
+                            MotionEvent.ACTION_UP,
+                            MotionEvent.ACTION_POINTER_DOWN -> {
+                                lastInteractionMs = System.currentTimeMillis()
+                            }
+                        }
+                        false
+                    }
                     webViewRef = this
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
@@ -281,12 +314,16 @@ fun ShopWebView(
                         }
 
                         override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                            isLoading = true
+                            // Only block the UI on the first load; in-app links would otherwise flash the overlay.
+                            if (!initialWebPaintDone) {
+                                isLoading = true
+                            }
                             hasError = false
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             isLoading = false
+                            initialWebPaintDone = true
                         }
 
                         @Deprecated("Deprecated in Java")
@@ -296,6 +333,7 @@ fun ShopWebView(
                             description: String?,
                             failingUrl: String?
                         ) {
+                            if (isCanceledNavigationError(description)) return
                             isLoading = false
                             hasError = true
                         }
@@ -305,11 +343,11 @@ fun ShopWebView(
                             request: WebResourceRequest?,
                             error: WebResourceError?
                         ) {
-                            if (request?.isForMainFrame == true) {
-                                isLoading = false
-                                hasError = true
-                                isOnline = false
-                            }
+                            if (request?.isForMainFrame != true) return
+                            if (isCanceledNavigationError(error?.description)) return
+                            isLoading = false
+                            hasError = true
+                            isOnline = false
                         }
                     }
                     webChromeClient = object : WebChromeClient() {
@@ -384,7 +422,7 @@ fun ShopWebView(
             }
         )
 
-        if (isLoading || hasError) {
+        if ((isLoading && !initialWebPaintDone) || hasError) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -420,39 +458,41 @@ fun ShopWebView(
             )
         }
 
-        // Hidden admin trigger zone: hold 5s in bottom-right corner.
-        Box(
+        // Hidden admin trigger zone: hold 5s in bottom-right corner (View + Handler avoids Compose pointer APIs).
+        AndroidView(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .size(84.dp)
-                .pointerInput(Unit) {
-                    while (true) {
-                        awaitPointerEventScope {
-                            val down = awaitPointerEvent().changes.firstOrNull { it.pressed }
-                            if (down != null) {
-                                var released = false
-                                val start = System.currentTimeMillis()
-                                while (!released) {
-                                    val event = awaitPointerEvent()
-                                    val current = event.changes.firstOrNull { it.id == down.id }
-                                    if (current == null || !current.pressed) {
-                                        released = true
-                                    } else {
-                                        val heldFor = System.currentTimeMillis() - start
-                                        if (heldFor >= 5000L) {
-                                            if (savedAdminPin.isNullOrBlank()) {
-                                                showPinSetupDialog = true
-                                            } else {
-                                                showPinDialog = true
-                                            }
-                                            released = true
-                                        }
-                                    }
+                .size(84.dp),
+            factory = { ctx ->
+                val overlay = View(ctx)
+                overlay.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                val handler = Handler(Looper.getMainLooper())
+                var pendingLongPress: Runnable? = null
+                overlay.setOnTouchListener { v, ev ->
+                    when (ev.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            pendingLongPress?.let(handler::removeCallbacks)
+                            pendingLongPress = Runnable {
+                                if (adminPinRef.value.isNullOrBlank()) {
+                                    showPinSetupDialog = true
+                                } else {
+                                    showPinDialog = true
                                 }
                             }
+                            pendingLongPress?.let { handler.postDelayed(it, 5000L) }
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                            pendingLongPress?.let(handler::removeCallbacks)
+                            pendingLongPress = null
                         }
                     }
+                    if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                        v.performClick()
+                    }
+                    false
                 }
+                overlay
+            }
         )
 
         if (showPinSetupDialog) {

@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.SBrowser" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.SBrowser" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/shop_portal_background</item>
+        <item name="android:colorBackground">@color/shop_portal_background</item>
+    </style>
 </resources>
