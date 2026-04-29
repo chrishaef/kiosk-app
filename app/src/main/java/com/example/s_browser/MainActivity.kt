@@ -8,25 +8,24 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
-import android.view.MotionEvent
-import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.ValueCallback
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
 import androidx.core.graphics.toColorInt
 import androidx.core.net.toUri
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,6 +47,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.material3.Text
@@ -67,6 +67,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.URLUtil
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.webkit.WebSettingsCompat
@@ -133,20 +134,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Kiosk-style: Back should not leave the app accidentally.
-        onBackPressedDispatcher.addCallback(
-            this,
-            object : OnBackPressedCallback(true) {
-                override fun handleOnBackPressed() {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Zurück ist deaktiviert.",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            }
-        )
+        
+        // Cleanup old staged downloads from previous sessions
+        cleanupStagedDownloads(this)
 
         setContent {
             ShopWebView(
@@ -163,6 +153,9 @@ class MainActivity : ComponentActivity() {
                     } else {
                         Toast.makeText(this, "Termux nicht gefunden.", Toast.LENGTH_SHORT).show()
                     }
+                },
+                onShareFile = {
+                    disableLockTaskMode()
                 },
                 onExit = {
                     disableLockTaskMode()
@@ -209,6 +202,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun cleanupStagedDownloads(context: Context) {
+    try {
+        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        if (dir != null && dir.exists()) {
+            dir.listFiles()?.forEach { it.delete() }
+        }
+    } catch (_: Exception) { }
+}
+
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
 fun ShopWebView(
@@ -216,6 +218,7 @@ fun ShopWebView(
     modifier: Modifier = Modifier,
     onMinimize: () -> Unit,
     onOpenTermux: () -> Unit,
+    onShareFile: () -> Unit,
     onExit: () -> Unit
 ) {
     val context = LocalContext.current
@@ -225,38 +228,34 @@ fun ShopWebView(
     var hasError by remember { mutableStateOf(false) }
     val retryTickState = remember { mutableIntStateOf(0) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    
+    // UI Visibility States
     var showPinDialog by remember { mutableStateOf(false) }
     var showPinSetupDialog by remember { mutableStateOf(false) }
     var showPinChangeDialog by remember { mutableStateOf(false) }
     var showExitConfirmDialog by remember { mutableStateOf(false) }
-    var showExitPinDialog by remember { mutableStateOf(false) }
     var showMinimizeConfirmDialog by remember { mutableStateOf(false) }
-    var showMinimizePinDialog by remember { mutableStateOf(false) }
     var showServerUrlDialog by remember { mutableStateOf(false) }
     var showAdminMenu by remember { mutableStateOf(false) }
-    var pinInput by remember { mutableStateOf("") }
-    var pinError by remember { mutableStateOf(false) }
-    var pinSetupInput by remember { mutableStateOf("") }
-    var pinSetupInput2 by remember { mutableStateOf("") }
-    var pinSetupError by remember { mutableStateOf("") }
-    var pinOldInput by remember { mutableStateOf("") }
-    var pinNewInput by remember { mutableStateOf("") }
-    var pinNewInput2 by remember { mutableStateOf("") }
-    var pinChangeError by remember { mutableStateOf("") }
-    var exitPinInput by remember { mutableStateOf("") }
-    var exitPinError by remember { mutableStateOf(false) }
-    var minimizePinInput by remember { mutableStateOf("") }
-    var minimizePinError by remember { mutableStateOf(false) }
-    var serverUrlInput by remember { mutableStateOf("") }
-    var serverUrlError by remember { mutableStateOf("") }
-    var serverUrlTestInfo by remember { mutableStateOf("") }
-    var serverUrlTestRunning by remember { mutableStateOf(false) }
-    val lastInteractionMsState = remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var showDownloadActionDialog by remember { mutableStateOf(false) }
+
+    // Persistent Settings & Tracking
     var savedAdminPin by remember(context) { mutableStateOf(loadAdminPin(context)) }
     var configuredUrl by remember(context) { mutableStateOf(loadServerUrl(context, url)) }
+    var downloadActionFileName by remember { mutableStateOf("") }
+    
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     val pendingDownloadIdState = remember { mutableLongStateOf(-1L) }
     var pendingDownloadSaveSource by remember { mutableStateOf<Uri?>(null) }
+
+    // Kiosk-style: Back should navigate within WebView if possible.
+    BackHandler {
+        if (webViewRef?.canGoBack() == true) {
+            webViewRef?.goBack()
+        } else {
+            Toast.makeText(context, "Zurück ist deaktiviert.", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -288,6 +287,7 @@ fun ShopWebView(
         }
     }
     val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
+    val currentAllowedHosts by rememberUpdatedState(allowedHosts)
     val scope = rememberCoroutineScope()
 
     val saveDownloadToLauncher = rememberLauncherForActivityResult(CreateDocumentWithMime()) { destUri ->
@@ -333,9 +333,8 @@ fun ShopWebView(
                                 if (titleIdx >= 0) cursor.getString(titleIdx) ?: "download" else "download"
                             if (srcUri != null) {
                                 pendingDownloadSaveSource = srcUri
-                                saveDownloadToLauncher.launch(
-                                    Pair(mimeTypeForFileName(title), title)
-                                )
+                                downloadActionFileName = title
+                                showDownloadActionDialog = true
                             }
                             pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
@@ -364,28 +363,10 @@ fun ShopWebView(
         }
     }
 
-    // Auto-reload on inactivity (5 minutes).
-    LaunchedEffect(lastInteractionMsState.longValue) {
-        while (true) {
-            delay(30000)
-            val idleMs = System.currentTimeMillis() - lastInteractionMsState.longValue
-            if (idleMs >= 5 * 60 * 1000L) {
-                webViewRef?.reload()
-                lastInteractionMsState.longValue = System.currentTimeMillis()
-            }
-        }
-    }
 
     // Match shop portal so any gap between WebView paints is not pure black.
     val portalBg = Color("#252b23".toColorInt())
-    val adminButtonColors = ButtonDefaults.buttonColors(
-        containerColor = Color(0xFF2F6D2C),
-        contentColor = Color.White
-    )
-    val adminDangerButtonColors = ButtonDefaults.buttonColors(
-        containerColor = Color(0xFF8A1E1E),
-        contentColor = Color.White
-    )
+    
     Box(modifier = modifier.fillMaxSize().background(portalBg)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -396,7 +377,9 @@ fun ShopWebView(
                     settings.useWideViewPort = true
                     settings.loadWithOverviewMode = true
                     settings.mediaPlaybackRequiresUserGesture = false
-                    // Prevent native long-press link previews/context badges from
+                    settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    
+                    // Prevent native long-press link previews
                     // stealing kiosk long-press gestures (easter egg/admin trigger).
                     isLongClickable = false
                     setOnLongClickListener { true }
@@ -404,19 +387,6 @@ fun ShopWebView(
                     applyShopWebViewColorPolicy(settings)
                     // Shopkasse --kas-bg-mid (WebView clears to this between full navigations).
                     setBackgroundColor("#252b23".toColorInt())
-                    // Do not call performClick() here: on WebView it can fire an extra accessibility
-                    // "click" and accidentally activate header links (e.g. "/" → admin session cleared).
-                    setOnTouchListener { _, e ->
-                        when (e.actionMasked) {
-                            MotionEvent.ACTION_DOWN,
-                            MotionEvent.ACTION_MOVE,
-                            MotionEvent.ACTION_UP,
-                            MotionEvent.ACTION_POINTER_DOWN -> {
-                                lastInteractionMsState.longValue = System.currentTimeMillis()
-                            }
-                        }
-                        false
-                    }
                     webViewRef = this
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
@@ -424,11 +394,10 @@ fun ShopWebView(
                             request: WebResourceRequest?
                         ): Boolean {
                             val host = request?.url?.host?.lowercase() ?: return true
-                            return host !in allowedHosts
+                            return host !in currentAllowedHosts
                         }
 
                         override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                            // Only block the UI on the first load; in-app links would otherwise flash the overlay.
                             if (!initialWebPaintDone) {
                                 isLoading = true
                             }
@@ -438,18 +407,6 @@ fun ShopWebView(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             isLoading = false
                             initialWebPaintDone = true
-                        }
-
-                        @Deprecated("Deprecated in Java")
-                        override fun onReceivedError(
-                            view: WebView?,
-                            errorCode: Int,
-                            description: String?,
-                            failingUrl: String?
-                        ) {
-                            if (isCanceledNavigationError(description)) return
-                            isLoading = false
-                            hasError = true
                         }
 
                         override fun onReceivedError(
@@ -504,7 +461,6 @@ fun ShopWebView(
                             req.setNotificationVisibility(
                                 DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
                             )
-                            // Staging in app-specific storage; user picks final path via SAF after completion.
                             if (context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) != null) {
                                 req.setDestinationInExternalFilesDir(
                                     context,
@@ -520,734 +476,529 @@ fun ShopWebView(
                             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                             val id = dm.enqueue(req)
                             pendingDownloadIdState.longValue = id
-                            Toast.makeText(
-                                context,
-                                "Download gestartet: $fileName",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                            Toast.makeText(context, "Download gestartet: $fileName", Toast.LENGTH_SHORT).show()
                         } catch (_: Exception) {
-                            // Fallback: open in external handler/browser.
                             try {
                                 val i = Intent(Intent.ACTION_VIEW, dlUrl.toUri())
                                 context.startActivity(i)
                             } catch (_: Exception) {
-                                Toast.makeText(
-                                    context,
-                                    "Download konnte nicht gestartet werden.",
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                Toast.makeText(context, "Download fehlgeschlagen.", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
                     loadUrl(configuredUrl)
                 }
+            },
+            onRelease = { webView ->
+                webView.destroy()
             }
         )
 
+        // Loading Overlay
         if ((isLoading && !initialWebPaintDone) || hasError) {
             Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xCC000000)),
+                modifier = Modifier.fillMaxSize().background(Color(0xCC000000)),
                 contentAlignment = Alignment.Center
             ) {
-                if (hasError) {
-                    Text(
-                        text = "Verbindung wird wiederhergestellt...",
-                        color = Color.White
-                    )
-                } else {
-                    CircularProgressIndicator(color = Color.White)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (hasError) {
+                        Text(
+                            text = "Verbindung zum lokalen Dienst wird wiederhergestellt...",
+                            color = Color.White,
+                            modifier = Modifier.padding(bottom = 16.dp)
+                        )
+                        Button(
+                            onClick = { 
+                                hasError = false
+                                webViewRef?.reload() 
+                            },
+                            colors = adminButtonColors()
+                        ) {
+                            Text("Manuell neu laden")
+                        }
+                    } else {
+                        CircularProgressIndicator(color = Color.White)
+                    }
                 }
             }
         }
 
-        // Hidden admin trigger zone: hold 5s in bottom-right corner (View + Handler avoids Compose pointer APIs).
-        AndroidView(
+        // Hidden admin trigger zone: hold 5s in bottom-right corner.
+        Box(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .size(84.dp),
-            factory = { ctx ->
-                val overlay = View(ctx)
-                overlay.setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                val handler = Handler(Looper.getMainLooper())
-                var pendingLongPress: Runnable? = null
-                overlay.setOnTouchListener { v, ev ->
-                    when (ev.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> {
-                            pendingLongPress?.let(handler::removeCallbacks)
-                            pendingLongPress = Runnable {
-                                if (adminPinRef.value.isNullOrBlank()) {
-                                    showPinSetupDialog = true
-                                } else {
-                                    showPinDialog = true
-                                }
+                .size(84.dp)
+                .pointerInput(adminPinRef.value) {
+                    awaitEachGesture {
+                        awaitFirstDown()
+                        val timer = withTimeoutOrNull(5000L) {
+                            waitForUpOrCancellation()
+                        }
+                        if (timer == null) {
+                            if (adminPinRef.value.isNullOrBlank()) {
+                                showPinSetupDialog = true
+                            } else {
+                                showPinDialog = true
                             }
-                            pendingLongPress?.let { handler.postDelayed(it, 5000L) }
-                        }
-                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            pendingLongPress?.let(handler::removeCallbacks)
-                            pendingLongPress = null
                         }
                     }
-                    if (ev.actionMasked == MotionEvent.ACTION_UP) {
-                        v.performClick()
-                    }
-                    false
                 }
-                overlay
-            }
         )
 
+        // --- Dialogs ---
+        
         if (showPinSetupDialog) {
-            AlertDialog(
-                onDismissRequest = {
+            AdminPinSetupDialog(
+                onDismiss = { showPinSetupDialog = false },
+                onPinSet = { pin ->
+                    saveAdminPin(context, pin)
+                    savedAdminPin = pin
                     showPinSetupDialog = false
-                    pinSetupInput = ""
-                    pinSetupInput2 = ""
-                    pinSetupError = ""
-                },
-                title = { Text("Admin-PIN festlegen") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = pinSetupInput,
-                            onValueChange = { pinSetupInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("Neuer PIN (mind. 4 Ziffern)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Next
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        OutlinedTextField(
-                            value = pinSetupInput2,
-                            onValueChange = { pinSetupInput2 = it.filter(Char::isDigit).take(8) },
-                            label = { Text("PIN wiederholen") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Done
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        )
-                        if (pinSetupError.isNotBlank()) {
-                            Text(
-                                text = pinSetupError,
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val p1 = pinSetupInput.trim()
-                            val p2 = pinSetupInput2.trim()
-                            when {
-                                p1.length < 4 -> pinSetupError = "PIN muss mindestens 4 Ziffern haben."
-                                p1 != p2 -> pinSetupError = "PINs stimmen nicht überein."
-                                else -> {
-                                    saveAdminPin(context, p1)
-                                    savedAdminPin = p1
-                                    showPinSetupDialog = false
-                                    showAdminMenu = true
-                                    pinSetupInput = ""
-                                    pinSetupInput2 = ""
-                                    pinSetupError = ""
-                                }
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Speichern") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showPinSetupDialog = false
-                            pinSetupInput = ""
-                            pinSetupInput2 = ""
-                            pinSetupError = ""
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                    showAdminMenu = true
                 }
             )
         }
 
         if (showPinDialog) {
-            AlertDialog(
-                onDismissRequest = {
+            AdminPinEntryDialog(
+                savedPin = savedAdminPin ?: "",
+                onDismiss = { showPinDialog = false },
+                onSuccess = {
                     showPinDialog = false
-                    pinInput = ""
-                    pinError = false
-                },
-                title = { Text("Admin-PIN") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = pinInput,
-                            onValueChange = { pinInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("PIN eingeben") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Done
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        if (pinError) {
-                            Text(
-                                text = "PIN falsch.",
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            if (pinInput == (savedAdminPin ?: "")) {
-                                showPinDialog = false
-                                showAdminMenu = true
-                                pinInput = ""
-                                pinError = false
-                            } else {
-                                pinError = true
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Öffnen") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showPinDialog = false
-                            pinInput = ""
-                            pinError = false
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                    showAdminMenu = true
                 }
             )
         }
 
         if (showPinChangeDialog) {
-            AlertDialog(
-                onDismissRequest = {
+            AdminPinChangeDialog(
+                currentSavedPin = savedAdminPin ?: "",
+                onDismiss = { showPinChangeDialog = false },
+                onPinChanged = { newPin ->
+                    saveAdminPin(context, newPin)
+                    savedAdminPin = newPin
                     showPinChangeDialog = false
-                    pinOldInput = ""
-                    pinNewInput = ""
-                    pinNewInput2 = ""
-                    pinChangeError = ""
-                },
-                title = { Text("PIN ändern") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = pinOldInput,
-                            onValueChange = { pinOldInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("Alter PIN") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Next
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        OutlinedTextField(
-                            value = pinNewInput,
-                            onValueChange = { pinNewInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("Neuer PIN (mind. 4 Ziffern)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Next
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        )
-                        OutlinedTextField(
-                            value = pinNewInput2,
-                            onValueChange = { pinNewInput2 = it.filter(Char::isDigit).take(8) },
-                            label = { Text("Neuen PIN wiederholen") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Done
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        )
-                        if (pinChangeError.isNotBlank()) {
-                            Text(
-                                text = pinChangeError,
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val oldPin = pinOldInput.trim()
-                            val p1 = pinNewInput.trim()
-                            val p2 = pinNewInput2.trim()
-                            when {
-                                oldPin != (savedAdminPin ?: "") -> pinChangeError = "Alter PIN ist falsch."
-                                p1.length < 4 -> pinChangeError = "Neuer PIN muss mindestens 4 Ziffern haben."
-                                p1 != p2 -> pinChangeError = "Neue PINs stimmen nicht überein."
-                                else -> {
-                                    saveAdminPin(context, p1)
-                                    savedAdminPin = p1
-                                    showPinChangeDialog = false
-                                    pinOldInput = ""
-                                    pinNewInput = ""
-                                    pinNewInput2 = ""
-                                    pinChangeError = ""
-                                }
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Speichern") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showPinChangeDialog = false
-                            pinOldInput = ""
-                            pinNewInput = ""
-                            pinNewInput2 = ""
-                            pinChangeError = ""
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
                 }
             )
         }
 
         if (showAdminMenu) {
-            AlertDialog(
-                onDismissRequest = { showAdminMenu = false },
-                title = { Text("Admin-Bereich") },
-                text = {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                webViewRef?.reload()
-                            },
-                            colors = adminButtonColors,
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text("Server neu laden") }
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                serverUrlInput = configuredUrl
-                                serverUrlError = ""
-                                showServerUrlDialog = true
-                            },
-                            colors = adminButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text("Server-Adresse ändern") }
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                showMinimizeConfirmDialog = true
-                            },
-                            colors = adminButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text("Minimieren") }
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                onOpenTermux()
-                            },
-                            colors = adminButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text("Zu Termux wechseln") }
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                showPinChangeDialog = true
-                            },
-                            colors = adminButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text("PIN ändern") }
-                        Button(
-                            onClick = {
-                                showAdminMenu = false
-                                showExitConfirmDialog = true
-                            },
-                            colors = adminDangerButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text("App beenden") }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showAdminMenu = false }) {
-                        Text("Schließen", color = Color(0xFFE8BC2E))
-                    }
-                },
-                dismissButton = {}
+            AdminMenuDialog(
+                onDismiss = { showAdminMenu = false },
+                onReload = { webViewRef?.reload() },
+                onChangeUrl = { showServerUrlDialog = true },
+                onMinimize = { showMinimizeConfirmDialog = true },
+                onOpenTermux = onOpenTermux,
+                onChangePin = { showPinChangeDialog = true },
+                onExit = { showExitConfirmDialog = true }
             )
         }
 
         if (showServerUrlDialog) {
-            AlertDialog(
-                onDismissRequest = {
+            ServerUrlDialog(
+                currentUrl = configuredUrl,
+                defaultUrl = url,
+                onDismiss = { showServerUrlDialog = false },
+                onSave = { newUrl ->
+                    saveServerUrl(context, newUrl)
+                    configuredUrl = newUrl
                     showServerUrlDialog = false
-                    serverUrlError = ""
-                    serverUrlTestInfo = ""
-                    serverUrlTestRunning = false
-                },
-                title = { Text("Server-Adresse") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = serverUrlInput,
-                            onValueChange = { serverUrlInput = it.trim() },
-                            label = { Text("URL des Webdienstes") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.Uri,
-                                imeAction = ImeAction.Done
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Button(
-                            onClick = {
-                                val normalized = normalizeServerUrl(serverUrlInput)
-                                if (normalized == null) {
-                                    serverUrlError = "Ungültige URL. Beispiel: http://127.0.0.1:8000"
-                                    serverUrlTestInfo = ""
-                                    return@Button
-                                }
-                                serverUrlError = ""
-                                serverUrlTestRunning = true
-                                serverUrlTestInfo = "Verbindung wird geprüft..."
-                                scope.launch {
-                                    val ok = isServerReachable(normalized)
-                                    serverUrlTestRunning = false
-                                    serverUrlTestInfo = if (ok) {
-                                        "Verbindung erfolgreich."
-                                    } else {
-                                        "Keine Verbindung zum Server."
-                                    }
-                                }
-                            },
-                            enabled = !serverUrlTestRunning,
-                            colors = adminButtonColors,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 8.dp)
-                        ) { Text(if (serverUrlTestRunning) "Prüfe..." else "Verbindung testen") }
-                        TextButton(
-                            onClick = {
-                                serverUrlInput = url
-                                serverUrlError = ""
-                                serverUrlTestInfo = "Standard gesetzt: $url"
-                            }
-                        ) { Text("Auf Standard zurücksetzen", color = Color(0xFFE8BC2E)) }
-                        if (serverUrlError.isNotBlank()) {
-                            Text(
-                                text = serverUrlError,
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                        if (serverUrlTestInfo.isNotBlank()) {
-                            Text(
-                                text = serverUrlTestInfo,
-                                color = if (serverUrlTestInfo.contains("erfolgreich")) Color(0xFF2F6D2C) else Color(0xFFE8BC2E),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val normalized = normalizeServerUrl(serverUrlInput)
-                            if (normalized == null) {
-                                serverUrlError = "Ungültige URL. Beispiel: http://127.0.0.1:8000"
-                            } else {
-                                saveServerUrl(context, normalized)
-                                configuredUrl = normalized
-                                showServerUrlDialog = false
-                                serverUrlError = ""
-                                serverUrlTestInfo = ""
-                                serverUrlTestRunning = false
-                                hasError = false
-                                retryTickState.intValue = 0
-                                webViewRef?.loadUrl(normalized)
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Speichern") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showServerUrlDialog = false
-                            serverUrlError = ""
-                            serverUrlTestInfo = ""
-                            serverUrlTestRunning = false
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                    hasError = false
+                    retryTickState.intValue = 0
+                    webViewRef?.loadUrl(newUrl)
                 }
             )
         }
 
         if (showExitConfirmDialog) {
-            AlertDialog(
-                onDismissRequest = { showExitConfirmDialog = false },
-                title = { Text("App wirklich beenden?") },
-                text = {
-                    Text("Zum Schutz vor Fehlbedienung muss das Beenden zusätzlich bestätigt werden.")
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            showExitConfirmDialog = false
-                            if (savedAdminPin.isNullOrBlank()) {
-                                onExit()
-                            } else {
-                                exitPinInput = ""
-                                exitPinError = false
-                                showExitPinDialog = true
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Weiter") }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showExitConfirmDialog = false }) {
-                        Text("Abbrechen", color = Color(0xFFE8BC2E))
-                    }
-                }
-            )
-        }
-
-        if (showExitPinDialog) {
-            AlertDialog(
-                onDismissRequest = {
-                    showExitPinDialog = false
-                    exitPinInput = ""
-                    exitPinError = false
-                },
-                title = { Text("Admin-PIN bestätigen") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = exitPinInput,
-                            onValueChange = { exitPinInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("PIN zum Beenden") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Done
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        if (exitPinError) {
-                            Text(
-                                text = "PIN falsch.",
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            if (exitPinInput == (savedAdminPin ?: "")) {
-                                showExitPinDialog = false
-                                exitPinInput = ""
-                                exitPinError = false
-                                onExit()
-                            } else {
-                                exitPinError = true
-                            }
-                        },
-                        colors = adminDangerButtonColors
-                    ) { Text("App beenden") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showExitPinDialog = false
-                            exitPinInput = ""
-                            exitPinError = false
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
-                }
+            KioskActionConfirmDialog(
+                title = "App wirklich beenden?",
+                text = "Zum Schutz vor Fehlbedienung muss das Beenden zusätzlich bestätigt werden.",
+                adminPin = savedAdminPin,
+                onDismiss = { showExitConfirmDialog = false },
+                onAction = onExit
             )
         }
 
         if (showMinimizeConfirmDialog) {
-            AlertDialog(
-                onDismissRequest = { showMinimizeConfirmDialog = false },
-                title = { Text("App minimieren?") },
-                text = {
-                    Text("Das Verlassen des Kiosk-Vordergrunds ist nur nach zusätzlicher Bestätigung erlaubt.")
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            showMinimizeConfirmDialog = false
-                            if (savedAdminPin.isNullOrBlank()) {
-                                onMinimize()
-                            } else {
-                                minimizePinInput = ""
-                                minimizePinError = false
-                                showMinimizePinDialog = true
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Weiter") }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showMinimizeConfirmDialog = false }) {
-                        Text("Abbrechen", color = Color(0xFFE8BC2E))
-                    }
-                }
+            KioskActionConfirmDialog(
+                title = "App minimieren?",
+                text = "Das Verlassen des Kiosk-Vordergrunds ist nur nach zusätzlicher Bestätigung erlaubt.",
+                adminPin = savedAdminPin,
+                onDismiss = { showMinimizeConfirmDialog = false },
+                onAction = onMinimize
             )
         }
 
-        if (showMinimizePinDialog) {
-            AlertDialog(
-                onDismissRequest = {
-                    showMinimizePinDialog = false
-                    minimizePinInput = ""
-                    minimizePinError = false
+        if (showDownloadActionDialog) {
+            DownloadActionDialog(
+                fileName = downloadActionFileName,
+                onDismiss = {
+                    showDownloadActionDialog = false
+                    pendingDownloadSaveSource = null
                 },
-                title = { Text("Admin-PIN bestätigen") },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = minimizePinInput,
-                            onValueChange = { minimizePinInput = it.filter(Char::isDigit).take(8) },
-                            label = { Text("PIN zum Minimieren") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.NumberPassword,
-                                imeAction = ImeAction.Done
-                            ),
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        if (minimizePinError) {
-                            Text(
-                                text = "PIN falsch.",
-                                color = Color(0xFFB00020),
-                                modifier = Modifier.padding(top = 8.dp)
-                            )
-                        }
-                    }
+                onSaveLocally = {
+                    showDownloadActionDialog = false
+                    saveDownloadToLauncher.launch(
+                        Pair(mimeTypeForFileName(downloadActionFileName), downloadActionFileName)
+                    )
                 },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            if (minimizePinInput == (savedAdminPin ?: "")) {
-                                showMinimizePinDialog = false
-                                minimizePinInput = ""
-                                minimizePinError = false
-                                onMinimize()
-                            } else {
-                                minimizePinError = true
-                            }
-                        },
-                        colors = adminButtonColors
-                    ) { Text("Minimieren") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showMinimizePinDialog = false
-                            minimizePinInput = ""
-                            minimizePinError = false
-                        }
-                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                onShare = {
+                    showDownloadActionDialog = false
+                    onShareFile()
+                    shareFile(context, pendingDownloadSaveSource, downloadActionFileName)
+                    pendingDownloadSaveSource = null
                 }
             )
         }
-
     }
+}
+
+// --- Specialized UI Components ---
+
+@Composable
+fun AdminPinSetupDialog(onDismiss: () -> Unit, onPinSet: (String) -> Unit) {
+    val p1 = remember { mutableStateOf("") }
+    val p2 = remember { mutableStateOf("") }
+    val errorMsg = remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Admin-PIN festlegen") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = p1.value,
+                    onValueChange = { p1.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("Neuer PIN (mind. 4 Ziffern)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = p2.value,
+                    onValueChange = { p2.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("PIN wiederholen") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                if (errorMsg.value.isNotBlank()) {
+                    Text(text = errorMsg.value, color = Color(0xFFB00020), modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                when {
+                    p1.value.length < 4 -> errorMsg.value = "PIN muss mindestens 4 Ziffern haben."
+                    p1.value != p2.value -> errorMsg.value = "PINs stimmen nicht überein."
+                    else -> onPinSet(p1.value)
+                }
+            }, colors = adminButtonColors()) { Text("Speichern") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen", color = adminAccentColor()) }
+        }
+    )
+}
+
+@Composable
+fun AdminPinEntryDialog(savedPin: String, onDismiss: () -> Unit, onSuccess: () -> Unit) {
+    val input = remember { mutableStateOf("") }
+    val hasError = remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Admin-PIN") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = input.value,
+                    onValueChange = { input.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("PIN eingeben") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (hasError.value) {
+                    Text(text = "PIN falsch.", color = Color(0xFFB00020), modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (input.value == savedPin) onSuccess() else hasError.value = true
+            }, colors = adminButtonColors()) { Text("Öffnen") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen", color = adminAccentColor()) }
+        }
+    )
+}
+
+@Composable
+fun AdminPinChangeDialog(currentSavedPin: String, onDismiss: () -> Unit, onPinChanged: (String) -> Unit) {
+    val oldInput = remember { mutableStateOf("") }
+    val n1 = remember { mutableStateOf("") }
+    val n2 = remember { mutableStateOf("") }
+    val errorMsg = remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("PIN ändern") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = oldInput.value,
+                    onValueChange = { oldInput.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("Alter PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = n1.value,
+                    onValueChange = { n1.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("Neuer PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                OutlinedTextField(
+                    value = n2.value,
+                    onValueChange = { n2.value = it.filter(Char::isDigit).take(8) },
+                    label = { Text("Neuen PIN wiederholen") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                if (errorMsg.value.isNotBlank()) {
+                    Text(text = errorMsg.value, color = Color(0xFFB00020), modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                when {
+                    oldInput.value != currentSavedPin -> errorMsg.value = "Alter PIN ist falsch."
+                    n1.value.length < 4 -> errorMsg.value = "Neuer PIN zu kurz."
+                    n1.value != n2.value -> errorMsg.value = "Neue PINs ungleich."
+                    else -> onPinChanged(n1.value)
+                }
+            }, colors = adminButtonColors()) { Text("Speichern") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen", color = adminAccentColor()) }
+        }
+    )
+}
+
+@Composable
+fun AdminMenuDialog(
+    onDismiss: () -> Unit,
+    onReload: () -> Unit,
+    onChangeUrl: () -> Unit,
+    onMinimize: () -> Unit,
+    onOpenTermux: () -> Unit,
+    onChangePin: () -> Unit,
+    onExit: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Admin-Bereich") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                AdminMenuButton("Server neu laden", onClick = { onDismiss(); onReload() })
+                AdminMenuButton("Server-Adresse ändern", onClick = { onDismiss(); onChangeUrl() })
+                AdminMenuButton("Minimieren", onClick = { onDismiss(); onMinimize() })
+                AdminMenuButton("Zu Termux wechseln", onClick = { onDismiss(); onOpenTermux() })
+                AdminMenuButton("PIN ändern", onClick = { onDismiss(); onChangePin() })
+                AdminMenuButton("App beenden", isDanger = true, onClick = { onDismiss(); onExit() })
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Schließen", color = adminAccentColor()) }
+        }
+    )
+}
+
+@Composable
+fun AdminMenuButton(text: String, isDanger: Boolean = false, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = if (isDanger) adminDangerButtonColors() else adminButtonColors(),
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+    ) { Text(text) }
+}
+
+@Composable
+fun ServerUrlDialog(currentUrl: String, defaultUrl: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var input by remember { mutableStateOf(currentUrl) }
+    var testInfo by remember { mutableStateOf("") }
+    var isTesting by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Server-Adresse") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it.trim() },
+                    label = { Text("URL des Webdienstes") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Button(
+                    onClick = {
+                        val norm = normalizeServerUrl(input) ?: return@Button
+                        isTesting = true
+                        testInfo = "Verbindung wird geprüft..."
+                        scope.launch {
+                            val ok = isServerReachable(norm)
+                            isTesting = false
+                            testInfo = if (ok) "Verbindung erfolgreich." else "Server nicht erreichbar."
+                        }
+                    },
+                    enabled = !isTesting,
+                    colors = adminButtonColors(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                ) { Text(if (isTesting) "Prüfe..." else "Verbindung testen") }
+                
+                TextButton(onClick = { input = defaultUrl }) {
+                    Text("Auf Standard zurücksetzen", color = adminAccentColor())
+                }
+                
+                if (testInfo.isNotBlank()) {
+                    Text(
+                        text = testInfo,
+                        color = if (testInfo.contains("erfolgreich")) Color(0xFF2F6D2C) else adminAccentColor(),
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val norm = normalizeServerUrl(input)
+                onSave(norm ?: currentUrl)
+            }, colors = adminButtonColors()) { Text("Speichern") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen", color = adminAccentColor()) }
+        }
+    )
+}
+
+@Composable
+fun KioskActionConfirmDialog(
+    title: String,
+    text: String,
+    adminPin: String?,
+    onDismiss: () -> Unit,
+    onAction: () -> Unit
+) {
+    val showPinEntry = remember { mutableStateOf(false) }
+
+    if (showPinEntry.value) {
+        AdminPinEntryDialog(savedPin = adminPin ?: "", onDismiss = { showPinEntry.value = false }, onSuccess = onAction)
+    } else {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(title) },
+            text = { Text(text) },
+            confirmButton = {
+                Button(onClick = {
+                    if (adminPin.isNullOrBlank()) onAction() else showPinEntry.value = true
+                }, colors = adminButtonColors()) { Text("Weiter") }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text("Abbrechen", color = adminAccentColor()) }
+            }
+        )
+    }
+}
+
+@Composable
+fun DownloadActionDialog(fileName: String, onDismiss: () -> Unit, onSaveLocally: () -> Unit, onShare: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Datei heruntergeladen") },
+        text = {
+            Column {
+                Text("Was möchten Sie mit '$fileName' tun?")
+            }
+        },
+        confirmButton = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Button(onClick = onSaveLocally, modifier = Modifier.fillMaxWidth(), colors = adminButtonColors()) {
+                    Text("Auf Gerät speichern")
+                }
+                Button(onClick = onShare, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), colors = adminButtonColors()) {
+                    Text("Per E-Mail senden")
+                }
+                TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                    Text("Abbrechen", color = adminAccentColor())
+                }
+            }
+        },
+        dismissButton = null
+    )
+}
+
+// --- Helper Functions & Theming ---
+
+@Composable fun adminButtonColors() = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6D2C), contentColor = Color.White)
+@Composable fun adminDangerButtonColors() = ButtonDefaults.buttonColors(containerColor = Color(0xFF8A1E1E), contentColor = Color.White)
+@Composable fun adminAccentColor() = Color(0xFFE8BC2E)
+
+private fun shareFile(context: Context, fileUri: Uri?, fileName: String) {
+    if (fileUri == null) return
+    try {
+        val file = java.io.File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), fileName)
+        if (!file.exists()) return
+        val contentUri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeTypeForFileName(fileName)
+            putExtra(Intent.EXTRA_STREAM, contentUri)
+            putExtra(Intent.EXTRA_SUBJECT, "Shopkasse - Dateiversand")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(shareIntent, "Datei senden via..."))
+    } catch (_: Exception) { }
 }
 
 private fun loadAdminPin(context: Context): String? {
     val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
-    val pin = prefs.getString("admin_pin", null)?.trim()
-    return if (pin.isNullOrBlank()) null else pin
+    return prefs.getString("admin_pin", null)?.trim()?.takeIf { it.isNotBlank() }
 }
 
 private fun saveAdminPin(context: Context, pin: String) {
-    val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
-    prefs.edit {
-        putString("admin_pin", pin)
-    }
+    context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE).edit { putString("admin_pin", pin) }
 }
 
 private fun loadServerUrl(context: Context, defaultUrl: String): String {
-    val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
-    val saved = prefs.getString("server_url", null)?.trim()
+    val saved = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE).getString("server_url", null)
     return normalizeServerUrl(saved ?: "") ?: defaultUrl
 }
 
 private fun saveServerUrl(context: Context, url: String) {
-    val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
-    prefs.edit {
-        putString("server_url", url)
-    }
+    context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE).edit { putString("server_url", url) }
 }
 
 private fun normalizeServerUrl(raw: String): String? {
     val input = raw.trim()
     if (input.isBlank()) return null
     val candidate = if ("://" in input) input else "http://$input"
-    val parsed = candidate.toUri()
-    val scheme = parsed.scheme?.lowercase()
-    val host = parsed.host
-    if (scheme !in setOf("http", "https") || host.isNullOrBlank()) return null
-    return candidate
+    return try {
+        val parsed = candidate.toUri()
+        if (parsed.scheme?.lowercase() in setOf("http", "https") && !parsed.host.isNullOrBlank()) candidate else null
+    } catch (_: Exception) { null }
 }
 
 private suspend fun isServerReachable(url: String): Boolean = withContext(Dispatchers.IO) {
-    return@withContext try {
+    try {
         val con = URL(url).openConnection() as HttpURLConnection
-        con.requestMethod = "GET"
         con.connectTimeout = 2500
         con.readTimeout = 2500
-        con.instanceFollowRedirects = true
-        con.connect()
-        val code = con.responseCode
-        con.disconnect()
-        code in 200..499
-    } catch (_: Exception) {
-        false
-    }
+        con.responseCode in 200..499
+    } catch (_: Exception) { false }
 }
