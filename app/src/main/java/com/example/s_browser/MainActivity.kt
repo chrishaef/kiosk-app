@@ -41,6 +41,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
@@ -55,6 +56,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowInsetsCompat
@@ -65,14 +67,13 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.URLUtil
 import android.widget.Toast
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
@@ -96,6 +97,8 @@ private fun applyShopWebViewColorPolicy(settings: WebSettings) {
 }
 
 class MainActivity : ComponentActivity() {
+    private var lockTaskHintShown = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -118,8 +121,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             ShopWebView(
                 url = "http://127.0.0.1:8000",
-                onMinimize = { moveTaskToBack(true) },
+                onMinimize = {
+                    disableLockTaskMode()
+                    moveTaskToBack(true)
+                },
                 onOpenTermux = {
+                    disableLockTaskMode()
                     val launchIntent = packageManager.getLaunchIntentForPackage("com.termux")
                     if (launchIntent != null) {
                         startActivity(launchIntent)
@@ -127,7 +134,10 @@ class MainActivity : ComponentActivity() {
                         Toast.makeText(this, "Termux nicht gefunden.", Toast.LENGTH_SHORT).show()
                     }
                 },
-                onExit = { finishAffinity() }
+                onExit = {
+                    disableLockTaskMode()
+                    finishAffinity()
+                }
             )
         }
     }
@@ -135,6 +145,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         enterImmersiveMode()
+        enableLockTaskModeIfPossible()
     }
 
     private fun enterImmersiveMode() {
@@ -142,6 +153,29 @@ class MainActivity : ComponentActivity() {
         controller.hide(WindowInsetsCompat.Type.systemBars())
         controller.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    private fun enableLockTaskModeIfPossible() {
+        try {
+            startLockTask()
+        } catch (_: Exception) {
+            if (!lockTaskHintShown) {
+                lockTaskHintShown = true
+                Toast.makeText(
+                    this,
+                    "Für vollen Kiosk-Schutz bitte App-Anheften/Screen Pinning aktivieren.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    private fun disableLockTaskMode() {
+        try {
+            stopLockTask()
+        } catch (_: Exception) {
+            // Ignore if not pinned/locked.
+        }
     }
 }
 
@@ -164,6 +198,11 @@ fun ShopWebView(
     var showPinDialog by remember { mutableStateOf(false) }
     var showPinSetupDialog by remember { mutableStateOf(false) }
     var showPinChangeDialog by remember { mutableStateOf(false) }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
+    var showExitPinDialog by remember { mutableStateOf(false) }
+    var showMinimizeConfirmDialog by remember { mutableStateOf(false) }
+    var showMinimizePinDialog by remember { mutableStateOf(false) }
+    var showServerUrlDialog by remember { mutableStateOf(false) }
     var showAdminMenu by remember { mutableStateOf(false) }
     var pinInput by remember { mutableStateOf("") }
     var pinError by remember { mutableStateOf(false) }
@@ -174,9 +213,17 @@ fun ShopWebView(
     var pinNewInput by remember { mutableStateOf("") }
     var pinNewInput2 by remember { mutableStateOf("") }
     var pinChangeError by remember { mutableStateOf("") }
-    var isOnline by remember { mutableStateOf(true) }
+    var exitPinInput by remember { mutableStateOf("") }
+    var exitPinError by remember { mutableStateOf(false) }
+    var minimizePinInput by remember { mutableStateOf("") }
+    var minimizePinError by remember { mutableStateOf(false) }
+    var serverUrlInput by remember { mutableStateOf("") }
+    var serverUrlError by remember { mutableStateOf("") }
+    var serverUrlTestInfo by remember { mutableStateOf("") }
+    var serverUrlTestRunning by remember { mutableStateOf(false) }
     var lastInteractionMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var savedAdminPin by remember(context) { mutableStateOf(loadAdminPin(context)) }
+    var configuredUrl by remember(context) { mutableStateOf(loadServerUrl(context, url)) }
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     var pendingDownloadId by remember { mutableLongStateOf(-1L) }
     var downloadedUri by remember { mutableStateOf<Uri?>(null) }
@@ -205,8 +252,15 @@ fun ShopWebView(
         filePathCallback = null
     }
 
-    val allowedHosts = remember { setOf("127.0.0.1", "localhost") }
+    val allowedHosts = remember(configuredUrl) {
+        buildSet {
+            add("127.0.0.1")
+            add("localhost")
+            configuredUrl.toUri().host?.lowercase()?.let { add(it) }
+        }
+    }
     val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
+    val scope = rememberCoroutineScope()
 
     // Reliable completion check for the most recent app-started download.
     LaunchedEffect(pendingDownloadId) {
@@ -247,19 +301,11 @@ fun ShopWebView(
     // Auto-retry after 3s whenever we are in error state.
     LaunchedEffect(hasError, retryTick) {
         if (hasError && retryTick > 0) {
-            webViewRef?.loadUrl(url)
+            webViewRef?.loadUrl(configuredUrl)
         }
         if (hasError) {
             delay(3000)
             retryTick += 1
-        }
-    }
-
-    // Connectivity/health poll for visible online/offline indicator.
-    LaunchedEffect(url) {
-        while (true) {
-            isOnline = checkUrlReachable(url)
-            delay(5000)
         }
     }
 
@@ -277,6 +323,14 @@ fun ShopWebView(
 
     // Match shop portal so any gap between WebView paints is not pure black.
     val portalBg = Color("#252b23".toColorInt())
+    val adminButtonColors = ButtonDefaults.buttonColors(
+        containerColor = Color(0xFF2F6D2C),
+        contentColor = Color.White
+    )
+    val adminDangerButtonColors = ButtonDefaults.buttonColors(
+        containerColor = Color(0xFF8A1E1E),
+        contentColor = Color.White
+    )
     Box(modifier = modifier.fillMaxSize().background(portalBg)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -347,7 +401,6 @@ fun ShopWebView(
                             if (isCanceledNavigationError(error?.description)) return
                             isLoading = false
                             hasError = true
-                            isOnline = false
                         }
                     }
                     webChromeClient = object : WebChromeClient() {
@@ -417,7 +470,7 @@ fun ShopWebView(
                             }
                         }
                     }
-                    loadUrl(url)
+                    loadUrl(configuredUrl)
                 }
             }
         )
@@ -438,24 +491,6 @@ fun ShopWebView(
                     CircularProgressIndicator(color = Color.White)
                 }
             }
-        }
-
-        // Online/offline badge.
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 10.dp, end = 10.dp)
-                .background(
-                    color = if (isOnline) Color(0xCC1F7A1F) else Color(0xCC8A1E1E),
-                    shape = RoundedCornerShape(10.dp)
-                )
-                .padding(horizontal = 10.dp, vertical = 4.dp)
-        ) {
-            Text(
-                text = if (isOnline) "Running" else "Offline",
-                color = Color.White,
-                style = MaterialTheme.typography.bodySmall
-            )
         }
 
         // Hidden admin trigger zone: hold 5s in bottom-right corner (View + Handler avoids Compose pointer APIs).
@@ -542,7 +577,7 @@ fun ShopWebView(
                     }
                 },
                 confirmButton = {
-                    TextButton(
+                    Button(
                         onClick = {
                             val p1 = pinSetupInput.trim()
                             val p2 = pinSetupInput2.trim()
@@ -559,7 +594,8 @@ fun ShopWebView(
                                     pinSetupError = ""
                                 }
                             }
-                        }
+                        },
+                        colors = adminButtonColors
                     ) { Text("Speichern") }
                 },
                 dismissButton = {
@@ -570,7 +606,7 @@ fun ShopWebView(
                             pinSetupInput2 = ""
                             pinSetupError = ""
                         }
-                    ) { Text("Abbrechen") }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
                 }
             )
         }
@@ -607,7 +643,7 @@ fun ShopWebView(
                     }
                 },
                 confirmButton = {
-                    TextButton(
+                    Button(
                         onClick = {
                             if (pinInput == (savedAdminPin ?: "")) {
                                 showPinDialog = false
@@ -617,7 +653,8 @@ fun ShopWebView(
                             } else {
                                 pinError = true
                             }
-                        }
+                        },
+                        colors = adminButtonColors
                     ) { Text("Öffnen") }
                 },
                 dismissButton = {
@@ -627,7 +664,7 @@ fun ShopWebView(
                             pinInput = ""
                             pinError = false
                         }
-                    ) { Text("Abbrechen") }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
                 }
             )
         }
@@ -694,7 +731,7 @@ fun ShopWebView(
                     }
                 },
                 confirmButton = {
-                    TextButton(
+                    Button(
                         onClick = {
                             val oldPin = pinOldInput.trim()
                             val p1 = pinNewInput.trim()
@@ -713,7 +750,8 @@ fun ShopWebView(
                                     pinChangeError = ""
                                 }
                             }
-                        }
+                        },
+                        colors = adminButtonColors
                     ) { Text("Speichern") }
                 },
                 dismissButton = {
@@ -725,7 +763,7 @@ fun ShopWebView(
                             pinNewInput2 = ""
                             pinChangeError = ""
                         }
-                    ) { Text("Abbrechen") }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
                 }
             )
         }
@@ -741,13 +779,27 @@ fun ShopWebView(
                                 showAdminMenu = false
                                 webViewRef?.reload()
                             },
+                            colors = adminButtonColors,
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("Server neu laden") }
                         Button(
                             onClick = {
                                 showAdminMenu = false
-                                onMinimize()
+                                serverUrlInput = configuredUrl
+                                serverUrlError = ""
+                                showServerUrlDialog = true
                             },
+                            colors = adminButtonColors,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp)
+                        ) { Text("Server-Adresse ändern") }
+                        Button(
+                            onClick = {
+                                showAdminMenu = false
+                                showMinimizeConfirmDialog = true
+                            },
+                            colors = adminButtonColors,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(top = 8.dp)
@@ -757,6 +809,7 @@ fun ShopWebView(
                                 showAdminMenu = false
                                 onOpenTermux()
                             },
+                            colors = adminButtonColors,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(top = 8.dp)
@@ -766,6 +819,7 @@ fun ShopWebView(
                                 showAdminMenu = false
                                 showPinChangeDialog = true
                             },
+                            colors = adminButtonColors,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(top = 8.dp)
@@ -773,8 +827,9 @@ fun ShopWebView(
                         Button(
                             onClick = {
                                 showAdminMenu = false
-                                onExit()
+                                showExitConfirmDialog = true
                             },
+                            colors = adminDangerButtonColors,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(top = 8.dp)
@@ -782,9 +837,293 @@ fun ShopWebView(
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = { showAdminMenu = false }) { Text("Schließen") }
+                    TextButton(onClick = { showAdminMenu = false }) {
+                        Text("Schließen", color = Color(0xFFE8BC2E))
+                    }
                 },
                 dismissButton = {}
+            )
+        }
+
+        if (showServerUrlDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    showServerUrlDialog = false
+                    serverUrlError = ""
+                    serverUrlTestInfo = ""
+                    serverUrlTestRunning = false
+                },
+                title = { Text("Server-Adresse") },
+                text = {
+                    Column {
+                        OutlinedTextField(
+                            value = serverUrlInput,
+                            onValueChange = { serverUrlInput = it.trim() },
+                            label = { Text("URL des Webdienstes") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Uri,
+                                imeAction = ImeAction.Done
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Button(
+                            onClick = {
+                                val normalized = normalizeServerUrl(serverUrlInput)
+                                if (normalized == null) {
+                                    serverUrlError = "Ungültige URL. Beispiel: http://127.0.0.1:8000"
+                                    serverUrlTestInfo = ""
+                                    return@Button
+                                }
+                                serverUrlError = ""
+                                serverUrlTestRunning = true
+                                serverUrlTestInfo = "Verbindung wird geprüft..."
+                                scope.launch {
+                                    val ok = isServerReachable(normalized)
+                                    serverUrlTestRunning = false
+                                    serverUrlTestInfo = if (ok) {
+                                        "Verbindung erfolgreich."
+                                    } else {
+                                        "Keine Verbindung zum Server."
+                                    }
+                                }
+                            },
+                            enabled = !serverUrlTestRunning,
+                            colors = adminButtonColors,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp)
+                        ) { Text(if (serverUrlTestRunning) "Prüfe..." else "Verbindung testen") }
+                        TextButton(
+                            onClick = {
+                                serverUrlInput = url
+                                serverUrlError = ""
+                                serverUrlTestInfo = "Standard gesetzt: $url"
+                            }
+                        ) { Text("Auf Standard zurücksetzen", color = Color(0xFFE8BC2E)) }
+                        if (serverUrlError.isNotBlank()) {
+                            Text(
+                                text = serverUrlError,
+                                color = Color(0xFFB00020),
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        if (serverUrlTestInfo.isNotBlank()) {
+                            Text(
+                                text = serverUrlTestInfo,
+                                color = if (serverUrlTestInfo.contains("erfolgreich")) Color(0xFF2F6D2C) else Color(0xFFE8BC2E),
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val normalized = normalizeServerUrl(serverUrlInput)
+                            if (normalized == null) {
+                                serverUrlError = "Ungültige URL. Beispiel: http://127.0.0.1:8000"
+                            } else {
+                                saveServerUrl(context, normalized)
+                                configuredUrl = normalized
+                                showServerUrlDialog = false
+                                serverUrlError = ""
+                                serverUrlTestInfo = ""
+                                serverUrlTestRunning = false
+                                hasError = false
+                                retryTick = 0
+                                webViewRef?.loadUrl(normalized)
+                            }
+                        },
+                        colors = adminButtonColors
+                    ) { Text("Speichern") }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showServerUrlDialog = false
+                            serverUrlError = ""
+                            serverUrlTestInfo = ""
+                            serverUrlTestRunning = false
+                        }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                }
+            )
+        }
+
+        if (showExitConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showExitConfirmDialog = false },
+                title = { Text("App wirklich beenden?") },
+                text = {
+                    Text("Zum Schutz vor Fehlbedienung muss das Beenden zusätzlich bestätigt werden.")
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showExitConfirmDialog = false
+                            if (savedAdminPin.isNullOrBlank()) {
+                                onExit()
+                            } else {
+                                exitPinInput = ""
+                                exitPinError = false
+                                showExitPinDialog = true
+                            }
+                        },
+                        colors = adminButtonColors
+                    ) { Text("Weiter") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showExitConfirmDialog = false }) {
+                        Text("Abbrechen", color = Color(0xFFE8BC2E))
+                    }
+                }
+            )
+        }
+
+        if (showExitPinDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    showExitPinDialog = false
+                    exitPinInput = ""
+                    exitPinError = false
+                },
+                title = { Text("Admin-PIN bestätigen") },
+                text = {
+                    Column {
+                        OutlinedTextField(
+                            value = exitPinInput,
+                            onValueChange = { exitPinInput = it.filter(Char::isDigit).take(8) },
+                            label = { Text("PIN zum Beenden") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.NumberPassword,
+                                imeAction = ImeAction.Done
+                            ),
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (exitPinError) {
+                            Text(
+                                text = "PIN falsch.",
+                                color = Color(0xFFB00020),
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (exitPinInput == (savedAdminPin ?: "")) {
+                                showExitPinDialog = false
+                                exitPinInput = ""
+                                exitPinError = false
+                                onExit()
+                            } else {
+                                exitPinError = true
+                            }
+                        },
+                        colors = adminDangerButtonColors
+                    ) { Text("App beenden") }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showExitPinDialog = false
+                            exitPinInput = ""
+                            exitPinError = false
+                        }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                }
+            )
+        }
+
+        if (showMinimizeConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showMinimizeConfirmDialog = false },
+                title = { Text("App minimieren?") },
+                text = {
+                    Text("Das Verlassen des Kiosk-Vordergrunds ist nur nach zusätzlicher Bestätigung erlaubt.")
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showMinimizeConfirmDialog = false
+                            if (savedAdminPin.isNullOrBlank()) {
+                                onMinimize()
+                            } else {
+                                minimizePinInput = ""
+                                minimizePinError = false
+                                showMinimizePinDialog = true
+                            }
+                        },
+                        colors = adminButtonColors
+                    ) { Text("Weiter") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showMinimizeConfirmDialog = false }) {
+                        Text("Abbrechen", color = Color(0xFFE8BC2E))
+                    }
+                }
+            )
+        }
+
+        if (showMinimizePinDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    showMinimizePinDialog = false
+                    minimizePinInput = ""
+                    minimizePinError = false
+                },
+                title = { Text("Admin-PIN bestätigen") },
+                text = {
+                    Column {
+                        OutlinedTextField(
+                            value = minimizePinInput,
+                            onValueChange = { minimizePinInput = it.filter(Char::isDigit).take(8) },
+                            label = { Text("PIN zum Minimieren") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.NumberPassword,
+                                imeAction = ImeAction.Done
+                            ),
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (minimizePinError) {
+                            Text(
+                                text = "PIN falsch.",
+                                color = Color(0xFFB00020),
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (minimizePinInput == (savedAdminPin ?: "")) {
+                                showMinimizePinDialog = false
+                                minimizePinInput = ""
+                                minimizePinError = false
+                                onMinimize()
+                            } else {
+                                minimizePinError = true
+                            }
+                        },
+                        colors = adminButtonColors
+                    ) { Text("Minimieren") }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showMinimizePinDialog = false
+                            minimizePinInput = ""
+                            minimizePinError = false
+                        }
+                    ) { Text("Abbrechen", color = Color(0xFFE8BC2E)) }
+                }
             )
         }
 
@@ -868,17 +1207,41 @@ private fun saveAdminPin(context: Context, pin: String) {
     }
 }
 
-private suspend fun checkUrlReachable(url: String): Boolean = withContext(Dispatchers.IO) {
+private fun loadServerUrl(context: Context, defaultUrl: String): String {
+    val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
+    val saved = prefs.getString("server_url", null)?.trim()
+    return normalizeServerUrl(saved ?: "") ?: defaultUrl
+}
+
+private fun saveServerUrl(context: Context, url: String) {
+    val prefs = context.getSharedPreferences("shopkasse_admin", Context.MODE_PRIVATE)
+    prefs.edit {
+        putString("server_url", url)
+    }
+}
+
+private fun normalizeServerUrl(raw: String): String? {
+    val input = raw.trim()
+    if (input.isBlank()) return null
+    val candidate = if ("://" in input) input else "http://$input"
+    val parsed = candidate.toUri()
+    val scheme = parsed.scheme?.lowercase()
+    val host = parsed.host
+    if (scheme !in setOf("http", "https") || host.isNullOrBlank()) return null
+    return candidate
+}
+
+private suspend fun isServerReachable(url: String): Boolean = withContext(Dispatchers.IO) {
     return@withContext try {
         val con = URL(url).openConnection() as HttpURLConnection
         con.requestMethod = "GET"
-        con.connectTimeout = 1500
-        con.readTimeout = 1500
+        con.connectTimeout = 2500
+        con.readTimeout = 2500
         con.instanceFollowRedirects = true
         con.connect()
         val code = con.responseCode
         con.disconnect()
-        code in 200..399
+        code in 200..499
     } catch (_: Exception) {
         false
     }
