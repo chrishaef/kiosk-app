@@ -5,7 +5,6 @@ import android.app.Activity
 import android.content.Context
 import android.app.DownloadManager
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -23,6 +22,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
 import androidx.core.graphics.toColorInt
@@ -77,6 +77,36 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
+
+/** MIME type hint for [Intent.ACTION_CREATE_DOCUMENT] from a download file name. */
+private fun mimeTypeForFileName(fileName: String): String {
+    return when {
+        fileName.endsWith(".pdf", ignoreCase = true) -> "application/pdf"
+        fileName.endsWith(".xlsx", ignoreCase = true) ->
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        fileName.endsWith(".xls", ignoreCase = true) -> "application/vnd.ms-excel"
+        fileName.endsWith(".zip", ignoreCase = true) -> "application/zip"
+        fileName.endsWith(".csv", ignoreCase = true) -> "text/csv"
+        else -> "application/octet-stream"
+    }
+}
+
+/**
+ * Opens the system "Save as" UI (SAF). Input: Pair(mimeType, suggestedFileName).
+ */
+private class CreateDocumentWithMime : ActivityResultContract<Pair<String, String>, Uri?>() {
+    override fun createIntent(context: Context, input: Pair<String, String>): Intent {
+        val (mimeType, title) = input
+        return Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mimeType
+            putExtra(Intent.EXTRA_TITLE, title)
+        }
+    }
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+        intent?.data?.takeIf { resultCode == Activity.RESULT_OK }
+}
 
 /** Chromium reports this when a load is superseded by a new navigation (not a real outage). */
 private fun isCanceledNavigationError(description: CharSequence?): Boolean {
@@ -226,9 +256,7 @@ fun ShopWebView(
     var configuredUrl by remember(context) { mutableStateOf(loadServerUrl(context, url)) }
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     val pendingDownloadIdState = remember { mutableLongStateOf(-1L) }
-    var downloadedUri by remember { mutableStateOf<Uri?>(null) }
-    var downloadedName by remember { mutableStateOf("") }
-    var showShareDialog by remember { mutableStateOf(false) }
+    var pendingDownloadSaveSource by remember { mutableStateOf<Uri?>(null) }
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -262,6 +290,30 @@ fun ShopWebView(
     val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
     val scope = rememberCoroutineScope()
 
+    val saveDownloadToLauncher = rememberLauncherForActivityResult(CreateDocumentWithMime()) { destUri ->
+        val src = pendingDownloadSaveSource
+        pendingDownloadSaveSource = null
+        if (src == null) return@rememberLauncherForActivityResult
+        if (destUri == null) {
+            Toast.makeText(context, "Speichern abgebrochen.", Toast.LENGTH_SHORT).show()
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(src)?.use { input ->
+                        context.contentResolver.openOutputStream(destUri)?.use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+                Toast.makeText(context, "Datei gespeichert.", Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
+                Toast.makeText(context, "Speichern fehlgeschlagen.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     // Reliable completion check for the most recent app-started download.
     LaunchedEffect(pendingDownloadIdState.longValue) {
         val id = pendingDownloadIdState.longValue
@@ -276,11 +328,14 @@ fun ShopWebView(
                         val titleIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
                         val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else -1
                         if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                            downloadedUri = dm.getUriForDownloadedFile(id)
-                            downloadedName =
-                                if (titleIdx >= 0) cursor.getString(titleIdx) ?: "Download" else "Download"
-                            if (downloadedUri != null) {
-                                showShareDialog = true
+                            val srcUri = dm.getUriForDownloadedFile(id)
+                            val title =
+                                if (titleIdx >= 0) cursor.getString(titleIdx) ?: "download" else "download"
+                            if (srcUri != null) {
+                                pendingDownloadSaveSource = srcUri
+                                saveDownloadToLauncher.launch(
+                                    Pair(mimeTypeForFileName(title), title)
+                                )
                             }
                             pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
@@ -449,10 +504,19 @@ fun ShopWebView(
                             req.setNotificationVisibility(
                                 DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
                             )
-                            req.setDestinationInExternalPublicDir(
-                                Environment.DIRECTORY_DOWNLOADS,
-                                fileName
-                            )
+                            // Staging in app-specific storage; user picks final path via SAF after completion.
+                            if (context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) != null) {
+                                req.setDestinationInExternalFilesDir(
+                                    context,
+                                    Environment.DIRECTORY_DOWNLOADS,
+                                    fileName
+                                )
+                            } else {
+                                req.setDestinationInExternalPublicDir(
+                                    Environment.DIRECTORY_DOWNLOADS,
+                                    fileName
+                                )
+                            }
                             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                             val id = dm.enqueue(req)
                             pendingDownloadIdState.longValue = id
@@ -1132,70 +1196,6 @@ fun ShopWebView(
             )
         }
 
-        if (showShareDialog) {
-            AlertDialog(
-                onDismissRequest = { showShareDialog = false },
-                title = { Text("Download abgeschlossen") },
-                text = { Text("Datei \"$downloadedName\" per Mail versenden?") },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            showShareDialog = false
-                            val uri = downloadedUri
-                            if (uri != null) {
-                                try {
-                                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                                        type = "*/*"
-                                        putExtra(Intent.EXTRA_STREAM, uri)
-                                        putExtra(Intent.EXTRA_SUBJECT, downloadedName)
-                                        putExtra(Intent.EXTRA_EMAIL, arrayOf(""))
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    val emailProbeIntent = Intent(
-                                        Intent.ACTION_SENDTO,
-                                        "mailto:".toUri()
-                                    )
-                                    val pm = context.packageManager
-                                    val emailActivities = pm.queryIntentActivities(
-                                        emailProbeIntent,
-                                        PackageManager.MATCH_DEFAULT_ONLY
-                                    )
-                                    if (emailActivities.isNotEmpty()) {
-                                        val targetedIntents = emailActivities.map { ri ->
-                                            Intent(sendIntent).apply { `package` = ri.activityInfo.packageName }
-                                        }
-                                        val primary = targetedIntents.first()
-                                        val chooser = Intent.createChooser(primary, "Per E-Mail senden")
-                                        if (targetedIntents.size > 1) {
-                                            chooser.putExtra(
-                                                Intent.EXTRA_INITIAL_INTENTS,
-                                                targetedIntents.drop(1).toTypedArray()
-                                            )
-                                        }
-                                        context.startActivity(chooser)
-                                    } else {
-                                        Toast.makeText(
-                                            context,
-                                            "Keine Mail-App gefunden.",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    }
-                                } catch (_: Exception) {
-                                    Toast.makeText(
-                                        context,
-                                        "Teilen konnte nicht gestartet werden.",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            }
-                        }
-                    ) { Text("Per E-Mail senden") }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showShareDialog = false }) { Text("Später") }
-                }
-            )
-        }
     }
 }
 
