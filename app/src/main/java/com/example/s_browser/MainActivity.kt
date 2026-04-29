@@ -193,7 +193,7 @@ fun ShopWebView(
     /** After the first successful paint, we stop the full-screen loader on navigations (avoids flicker). */
     var initialWebPaintDone by remember { mutableStateOf(false) }
     var hasError by remember { mutableStateOf(false) }
-    var retryTick by remember { mutableIntStateOf(0) }
+    val retryTickState = remember { mutableIntStateOf(0) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showPinDialog by remember { mutableStateOf(false) }
     var showPinSetupDialog by remember { mutableStateOf(false) }
@@ -221,11 +221,11 @@ fun ShopWebView(
     var serverUrlError by remember { mutableStateOf("") }
     var serverUrlTestInfo by remember { mutableStateOf("") }
     var serverUrlTestRunning by remember { mutableStateOf(false) }
-    var lastInteractionMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val lastInteractionMsState = remember { mutableLongStateOf(System.currentTimeMillis()) }
     var savedAdminPin by remember(context) { mutableStateOf(loadAdminPin(context)) }
     var configuredUrl by remember(context) { mutableStateOf(loadServerUrl(context, url)) }
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
-    var pendingDownloadId by remember { mutableLongStateOf(-1L) }
+    val pendingDownloadIdState = remember { mutableLongStateOf(-1L) }
     var downloadedUri by remember { mutableStateOf<Uri?>(null) }
     var downloadedName by remember { mutableStateOf("") }
     var showShareDialog by remember { mutableStateOf(false) }
@@ -263,8 +263,8 @@ fun ShopWebView(
     val scope = rememberCoroutineScope()
 
     // Reliable completion check for the most recent app-started download.
-    LaunchedEffect(pendingDownloadId) {
-        val id = pendingDownloadId
+    LaunchedEffect(pendingDownloadIdState.longValue) {
+        val id = pendingDownloadIdState.longValue
         if (id <= 0L) return@LaunchedEffect
         val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         while (true) {
@@ -282,41 +282,41 @@ fun ShopWebView(
                             if (downloadedUri != null) {
                                 showShareDialog = true
                             }
-                            pendingDownloadId = -1L
+                            pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
                         }
                         if (status == DownloadManager.STATUS_FAILED) {
-                            pendingDownloadId = -1L
+                            pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
                         }
                     }
                 }
             } catch (_: Exception) {
-                pendingDownloadId = -1L
+                pendingDownloadIdState.longValue = -1L
                 return@LaunchedEffect
             }
             delay(1000)
         }
     }
     // Auto-retry after 3s whenever we are in error state.
-    LaunchedEffect(hasError, retryTick) {
-        if (hasError && retryTick > 0) {
+    LaunchedEffect(hasError, retryTickState.intValue) {
+        if (hasError && retryTickState.intValue > 0) {
             webViewRef?.loadUrl(configuredUrl)
         }
         if (hasError) {
             delay(3000)
-            retryTick += 1
+            retryTickState.intValue += 1
         }
     }
 
     // Auto-reload on inactivity (5 minutes).
-    LaunchedEffect(lastInteractionMs) {
+    LaunchedEffect(lastInteractionMsState.longValue) {
         while (true) {
             delay(30000)
-            val idleMs = System.currentTimeMillis() - lastInteractionMs
+            val idleMs = System.currentTimeMillis() - lastInteractionMsState.longValue
             if (idleMs >= 5 * 60 * 1000L) {
                 webViewRef?.reload()
-                lastInteractionMs = System.currentTimeMillis()
+                lastInteractionMsState.longValue = System.currentTimeMillis()
             }
         }
     }
@@ -341,6 +341,11 @@ fun ShopWebView(
                     settings.useWideViewPort = true
                     settings.loadWithOverviewMode = true
                     settings.mediaPlaybackRequiresUserGesture = false
+                    // Prevent native long-press link previews/context badges from
+                    // stealing kiosk long-press gestures (easter egg/admin trigger).
+                    isLongClickable = false
+                    setOnLongClickListener { true }
+                    isHapticFeedbackEnabled = false
                     applyShopWebViewColorPolicy(settings)
                     // Shopkasse --kas-bg-mid (WebView clears to this between full navigations).
                     setBackgroundColor("#252b23".toColorInt())
@@ -352,7 +357,7 @@ fun ShopWebView(
                             MotionEvent.ACTION_MOVE,
                             MotionEvent.ACTION_UP,
                             MotionEvent.ACTION_POINTER_DOWN -> {
-                                lastInteractionMs = System.currentTimeMillis()
+                                lastInteractionMsState.longValue = System.currentTimeMillis()
                             }
                         }
                         false
@@ -450,7 +455,7 @@ fun ShopWebView(
                             )
                             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                             val id = dm.enqueue(req)
-                            pendingDownloadId = id
+                            pendingDownloadIdState.longValue = id
                             Toast.makeText(
                                 context,
                                 "Download gestartet: $fileName",
@@ -931,7 +936,7 @@ fun ShopWebView(
                                 serverUrlTestInfo = ""
                                 serverUrlTestRunning = false
                                 hasError = false
-                                retryTick = 0
+                                retryTickState.intValue = 0
                                 webViewRef?.loadUrl(normalized)
                             }
                         },
