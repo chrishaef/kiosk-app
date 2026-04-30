@@ -145,14 +145,13 @@ class MainActivity : ComponentActivity() {
                     disableLockTaskMode()
                     moveTaskToBack(true)
                 },
-                onOpenTermux = {
+                onGoHome = {
                     disableLockTaskMode()
-                    val launchIntent = packageManager.getLaunchIntentForPackage("com.termux")
-                    if (launchIntent != null) {
-                        startActivity(launchIntent)
-                    } else {
-                        Toast.makeText(this, "Termux nicht gefunden.", Toast.LENGTH_SHORT).show()
+                    val intent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_HOME)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
                     }
+                    startActivity(intent)
                 },
                 onShareFile = {
                     disableLockTaskMode()
@@ -221,7 +220,7 @@ fun ShopWebView(
     url: String,
     modifier: Modifier = Modifier,
     onMinimize: () -> Unit,
-    onOpenTermux: () -> Unit,
+    onGoHome: () -> Unit,
     onShareFile: () -> Unit,
     onExit: () -> Unit
 ) {
@@ -505,24 +504,39 @@ fun ShopWebView(
         // Loading Overlay
         if ((isLoading && !initialWebPaintDone) || hasError) {
             Box(
-                modifier = Modifier.fillMaxSize().background(Color(0xCC000000)),
+                modifier = Modifier.fillMaxSize().background(portalBg), // Opaque background to hide WebView errors
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     if (hasError) {
                         Text(
-                            text = "Verbindung zum lokalen Dienst wird wiederhergestellt...",
+                            text = "Shopsystem nicht erreichbar!",
                             color = Color.White,
-                            modifier = Modifier.padding(bottom = 16.dp)
+                            modifier = Modifier.padding(bottom = 4.dp)
                         )
+                        Text(
+                            text = "Termux gestartet?",
+                            color = adminAccentColor(),
+                            modifier = Modifier.padding(bottom = 24.dp)
+                        )
+                        
                         Button(
                             onClick = { 
                                 hasError = false
                                 webViewRef?.reload() 
                             },
-                            colors = adminButtonColors()
+                            colors = adminButtonColors(),
+                            modifier = Modifier.fillMaxWidth(0.6f)
                         ) {
-                            Text("Manuell neu laden")
+                            Text("Erneut versuchen")
+                        }
+                        
+                        Button(
+                            onClick = onGoHome,
+                            colors = adminButtonColors(),
+                            modifier = Modifier.fillMaxWidth(0.6f).padding(top = 12.dp)
+                        ) {
+                            Text("Zurück")
                         }
                     } else {
                         CircularProgressIndicator(color = Color.White)
@@ -596,7 +610,7 @@ fun ShopWebView(
                 onReload = { webViewRef?.reload() },
                 onChangeUrl = { showServerUrlDialog = true },
                 onMinimize = { showMinimizeConfirmDialog = true },
-                onOpenTermux = onOpenTermux,
+                onGoHome = onGoHome,
                 onChangePin = { showPinChangeDialog = true },
                 onExit = { showExitConfirmDialog = true }
             )
@@ -805,7 +819,7 @@ fun AdminMenuDialog(
     onReload: () -> Unit,
     onChangeUrl: () -> Unit,
     onMinimize: () -> Unit,
-    onOpenTermux: () -> Unit,
+    onGoHome: () -> Unit,
     onChangePin: () -> Unit,
     onExit: () -> Unit
 ) {
@@ -817,7 +831,7 @@ fun AdminMenuDialog(
                 AdminMenuButton("Server neu laden", onClick = { onDismiss(); onReload() })
                 AdminMenuButton("Server-Adresse ändern", onClick = { onDismiss(); onChangeUrl() })
                 AdminMenuButton("Minimieren", onClick = { onDismiss(); onMinimize() })
-                AdminMenuButton("Zu Termux wechseln", onClick = { onDismiss(); onOpenTermux() })
+                AdminMenuButton("App verlassen", onClick = { onDismiss(); onGoHome() })
                 AdminMenuButton("PIN ändern", onClick = { onDismiss(); onChangePin() })
                 AdminMenuButton("App beenden", isDanger = true, onClick = { onDismiss(); onExit() })
             }
