@@ -202,11 +202,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun cleanupStagedDownloads(context: Context) {
+private fun cleanupStagedDownloads(context: Context, exclude: String? = null) {
     try {
         val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         if (dir != null && dir.exists()) {
-            dir.listFiles()?.forEach { it.delete() }
+            dir.listFiles()?.forEach { 
+                if (exclude == null || it.name != exclude) {
+                    it.delete() 
+                }
+            }
         }
     } catch (_: Exception) { }
 }
@@ -306,6 +310,8 @@ fun ShopWebView(
                             input.copyTo(output)
                         }
                     }
+                    // Delete the staged file immediately after successful copy
+                    java.io.File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), downloadActionFileName).delete()
                 }
                 Toast.makeText(context, "Datei gespeichert.", Toast.LENGTH_SHORT).show()
             } catch (_: Exception) {
@@ -332,6 +338,8 @@ fun ShopWebView(
                             val title =
                                 if (titleIdx >= 0) cursor.getString(titleIdx) ?: "download" else "download"
                             if (srcUri != null) {
+                                // Clean up all older files before showing the new one
+                                cleanupStagedDownloads(context, exclude = title)
                                 pendingDownloadSaveSource = srcUri
                                 downloadActionFileName = title
                                 showDownloadActionDialog = true
