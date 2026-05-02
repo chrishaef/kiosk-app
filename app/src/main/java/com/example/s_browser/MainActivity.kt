@@ -240,6 +240,7 @@ fun ShopWebView(
     var showMinimizeConfirmDialog by remember { mutableStateOf(false) }
     var showServerUrlDialog by remember { mutableStateOf(false) }
     var showAdminMenu by remember { mutableStateOf(false) }
+    var showGoHomeConfirmDialog by remember { mutableStateOf(false) }
     var showDownloadActionDialog by remember { mutableStateOf(false) }
 
     // Persistent Settings & Tracking
@@ -532,7 +533,7 @@ fun ShopWebView(
                         }
                         
                         Button(
-                            onClick = onGoHome,
+                            onClick = { showGoHomeConfirmDialog = true },
                             colors = adminButtonColors(),
                             modifier = Modifier.fillMaxWidth(0.6f).padding(top = 12.dp)
                         ) {
@@ -610,7 +611,7 @@ fun ShopWebView(
                 onReload = { webViewRef?.reload() },
                 onChangeUrl = { showServerUrlDialog = true },
                 onMinimize = { showMinimizeConfirmDialog = true },
-                onGoHome = onGoHome,
+                onGoHome = { showGoHomeConfirmDialog = true },
                 onChangePin = { showPinChangeDialog = true },
                 onExit = { showExitConfirmDialog = true }
             )
@@ -649,6 +650,16 @@ fun ShopWebView(
                 adminPin = savedAdminPin,
                 onDismiss = { showMinimizeConfirmDialog = false },
                 onAction = onMinimize
+            )
+        }
+
+        if (showGoHomeConfirmDialog) {
+            KioskActionConfirmDialog(
+                title = "Kiosk-Modus verlassen?",
+                text = "Möchten Sie den geschützten Bereich verlassen und zum Startbildschirm zurückkehren?",
+                adminPin = savedAdminPin,
+                onDismiss = { showGoHomeConfirmDialog = false },
+                onAction = onGoHome
             )
         }
 
