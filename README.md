@@ -1,6 +1,10 @@
 # kiosk-app
 
-Android WebView-Kiosk-App für die lokale **Termux-Shopkasse**.  
+Die Android WebView-Kiosk-App für die lokale **Termux-Shopkasse**. Die App ist optimiert für den offline Betrieb der **termux-shopkasse**. Sie legt sich in Vollbildansicht in den Vordergrund und heftet sich im Sperrbildschirm von Android an.
+Bei Bedarf kann in den Appeinsteistellungen aber auch eine andere Domain/Adresse hinterlegt werden. So kann die App z.B. auch im Heimnetz zur Anzeige von **HomeAssistant** genutzt werden.
+
+Zum Aufraufen des Admin-Bereichs und der App Einstellungen muss 5s lang ein Klick oder Tipp auf die untere rechte Bildschirmecke durchgeführt werden. Bei erstinstallation muss ein Admin Pin vergeben werden, welcher den Bereich und andere Funktionen (Schließen der App) absichert.
+
 Dieses Repo enthält den Android-Client (APK), nicht das FastAPI-Backend.
 
 ## Zugehöriges Backend-Repo
@@ -15,7 +19,12 @@ Dieses Repo enthält den Android-Client (APK), nicht das FastAPI-Backend.
 - URL im Admin-Menü änderbar (inkl. Verbindungstest)
 - Upload/Download-Unterstützung im WebView
 
-## Voraussetzungen
+## Installation
+
+- .apk aus dem aktuellesten Release herunterladen und installieren
+- vorerst keine Bereitstellung der App über den App-Store!
+
+## Voraussetzungen für eigene Builds
 
 - Android Studio (aktueller Stable-Stand)
 - Android SDK (minSdk 24, targetSdk 36 laut Projektkonfiguration)
