@@ -252,13 +252,9 @@ fun ShopWebView(
     val pendingDownloadIdState = remember { mutableLongStateOf(-1L) }
     var pendingDownloadSaveSource by remember { mutableStateOf<Uri?>(null) }
 
-    // Kiosk-style: Back should navigate within WebView if possible.
+    // Kiosk-style: Back is completely disabled to prevent re-entering restricted areas.
     BackHandler {
-        if (webViewRef?.canGoBack() == true) {
-            webViewRef?.goBack()
-        } else {
-            Toast.makeText(context, "Zurück ist deaktiviert.", Toast.LENGTH_SHORT).show()
-        }
+        Toast.makeText(context, "Zurück ist deaktiviert.", Toast.LENGTH_SHORT).show()
     }
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
