@@ -419,11 +419,14 @@ fun ShopWebView(
                             isLoading = false
                             initialWebPaintDone = true
                             
-                            // Force content to fill the full height of the WebView to avoid background bars
+                            // Force content to stretch to full viewport height. 
+                            // This ensures backgrounds and footers reach the bottom even if content is short.
                             view?.evaluateJavascript(
                                 "(function() { " +
                                 "   var style = document.createElement('style');" +
-                                "   style.innerHTML = 'html, body { min-height: 100vh !important; height: auto !important; }';" +
+                                "   style.innerHTML = 'html, body { height: 100% !important; margin: 0; padding: 0; display: flex; flex-direction: column; } " +
+                                "                      body > * { flex-shrink: 0; } " +
+                                "                      footer, .footer { margin-top: auto !important; }';" +
                                 "   document.head.appendChild(style);" +
                                 "})();", 
                                 null
