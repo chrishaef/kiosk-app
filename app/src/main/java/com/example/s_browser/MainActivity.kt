@@ -376,6 +376,10 @@ fun ShopWebView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
                 WebView(context).apply {
+                    layoutParams = android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.useWideViewPort = true
@@ -389,8 +393,11 @@ fun ShopWebView(
                     setOnLongClickListener { true }
                     isHapticFeedbackEnabled = false
                     applyShopWebViewColorPolicy(settings)
-                    // Shopkasse --kas-bg-mid (WebView clears to this between full navigations).
-                    setBackgroundColor("#252b23".toColorInt())
+                    
+                    // Make WebView background transparent to let the app's portalBg shine through
+                    // This avoids ugly white/mismatched bars if the content is short.
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+
                     webViewRef = this
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
@@ -411,6 +418,16 @@ fun ShopWebView(
                         override fun onPageFinished(view: WebView?, url: String?) {
                             isLoading = false
                             initialWebPaintDone = true
+                            
+                            // Force content to fill the full height of the WebView to avoid background bars
+                            view?.evaluateJavascript(
+                                "(function() { " +
+                                "   var style = document.createElement('style');" +
+                                "   style.innerHTML = 'html, body { min-height: 100vh !important; height: auto !important; }';" +
+                                "   document.head.appendChild(style);" +
+                                "})();", 
+                                null
+                            )
                         }
 
                         override fun onReceivedError(
