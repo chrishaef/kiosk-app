@@ -117,6 +117,31 @@ private fun isCanceledNavigationError(description: CharSequence?): Boolean {
         s.contains("ERR_CANCELED", ignoreCase = true)
 }
 
+private fun applyWebViewViewportHeightFix(view: WebView?) {
+    view ?: return
+    view.evaluateJavascript(
+        "(function(){try{" +
+            "window.__sbApplyViewportFix=function(){" +
+            "var h=(window.visualViewport&&window.visualViewport.height)||window.innerHeight||document.documentElement.clientHeight;" +
+            "if(!h){return;}" +
+            "var px=Math.round(h)+'px';" +
+            "document.documentElement.style.setProperty('--sb-vh',px);" +
+            "var st=document.getElementById('sb-vh-fix');" +
+            "if(!st){st=document.createElement('style');st.id='sb-vh-fix';(document.head||document.documentElement).appendChild(st);}" +
+            "st.textContent='html,body{min-height:var(--sb-vh)!important;}';" +
+            "};" +
+            "if(!window.__sbViewportFixInstalled){" +
+            "window.addEventListener('resize',window.__sbApplyViewportFix,{passive:true});" +
+            "window.addEventListener('orientationchange',function(){setTimeout(window.__sbApplyViewportFix,120);},{passive:true});" +
+            "if(window.visualViewport){window.visualViewport.addEventListener('resize',window.__sbApplyViewportFix,{passive:true});}" +
+            "window.__sbViewportFixInstalled=true;" +
+            "}" +
+            "if(window.__sbApplyViewportFix){window.__sbApplyViewportFix();}" +
+            "}catch(_e){}})();",
+        null
+    )
+}
+
 @Suppress("DEPRECATION")
 private fun applyShopWebViewColorPolicy(settings: WebSettings) {
     if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
@@ -242,6 +267,7 @@ fun ShopWebView(
     var showAdminMenu by remember { mutableStateOf(false) }
     var showGoHomeConfirmDialog by remember { mutableStateOf(false) }
     var showDownloadActionDialog by remember { mutableStateOf(false) }
+    var showDownloadProgressOverlay by remember { mutableStateOf(false) }
 
     // Persistent Settings & Tracking
     var savedAdminPin by remember(context) { mutableStateOf(loadAdminPin(context)) }
@@ -303,7 +329,9 @@ fun ShopWebView(
                 withContext(Dispatchers.IO) {
                     context.contentResolver.openInputStream(src)?.use { input ->
                         context.contentResolver.openOutputStream(destUri)?.use { output ->
-                            input.copyTo(output)
+                            // Use a larger copy buffer for SAF writes to reduce I/O overhead
+                            // on slower Android storage and improve save latency.
+                            input.copyTo(output, bufferSize = 256 * 1024)
                         }
                     }
                     // Delete the staged file immediately after successful copy
@@ -340,16 +368,19 @@ fun ShopWebView(
                                 downloadActionFileName = title
                                 showDownloadActionDialog = true
                             }
+                            showDownloadProgressOverlay = false
                             pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
                         }
                         if (status == DownloadManager.STATUS_FAILED) {
+                            showDownloadProgressOverlay = false
                             pendingDownloadIdState.longValue = -1L
                             return@LaunchedEffect
                         }
                     }
                 }
             } catch (_: Exception) {
+                showDownloadProgressOverlay = false
                 pendingDownloadIdState.longValue = -1L
                 return@LaunchedEffect
             }
@@ -376,14 +407,12 @@ fun ShopWebView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
                 WebView(context).apply {
-                    layoutParams = android.view.ViewGroup.LayoutParams(
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
-                    )
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
-                    settings.useWideViewPort = true
-                    settings.loadWithOverviewMode = true
+                    // Kiosk app runs fixed full-screen content; disabling overview/wide viewport
+                    // avoids WebView auto-scaling quirks that can cause bottom white gaps.
+                    settings.useWideViewPort = false
+                    settings.loadWithOverviewMode = false
                     settings.mediaPlaybackRequiresUserGesture = false
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
                     
@@ -393,11 +422,8 @@ fun ShopWebView(
                     setOnLongClickListener { true }
                     isHapticFeedbackEnabled = false
                     applyShopWebViewColorPolicy(settings)
-                    
-                    // Make WebView background transparent to let the app's portalBg shine through
-                    // This avoids ugly white/mismatched bars if the content is short.
-                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-
+                    // Shopkasse --kas-bg-mid (WebView clears to this between full navigations).
+                    setBackgroundColor("#252b23".toColorInt())
                     webViewRef = this
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
@@ -413,24 +439,16 @@ fun ShopWebView(
                                 isLoading = true
                             }
                             hasError = false
+                            applyWebViewViewportHeightFix(view)
+                        }
+
+                        override fun onPageCommitVisible(view: WebView?, url: String?) {
+                            applyWebViewViewportHeightFix(view)
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             isLoading = false
                             initialWebPaintDone = true
-                            
-                            // Force content to stretch to full viewport height. 
-                            // This ensures backgrounds and footers reach the bottom even if content is short.
-                            view?.evaluateJavascript(
-                                "(function() { " +
-                                "   var style = document.createElement('style');" +
-                                "   style.innerHTML = 'html, body { height: 100% !important; margin: 0; padding: 0; display: flex; flex-direction: column; } " +
-                                "                      body > * { flex-shrink: 0; } " +
-                                "                      footer, .footer { margin-top: auto !important; }';" +
-                                "   document.head.appendChild(style);" +
-                                "})();", 
-                                null
-                            )
                         }
 
                         override fun onReceivedError(
@@ -499,9 +517,11 @@ fun ShopWebView(
                             }
                             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                             val id = dm.enqueue(req)
+                            showDownloadProgressOverlay = true
                             pendingDownloadIdState.longValue = id
                             Toast.makeText(context, "Download gestartet: $fileName", Toast.LENGTH_SHORT).show()
                         } catch (_: Exception) {
+                            showDownloadProgressOverlay = false
                             try {
                                 val i = Intent(Intent.ACTION_VIEW, dlUrl.toUri())
                                 context.startActivity(i)
@@ -558,6 +578,27 @@ fun ShopWebView(
                     } else {
                         CircularProgressIndicator(color = Color.White)
                     }
+                }
+            }
+        }
+
+        if (showDownloadProgressOverlay) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color(0x77000000)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = adminAccentColor())
+                    Text(
+                        text = "Download läuft ...",
+                        color = Color.White,
+                        modifier = Modifier.padding(top = 12.dp)
+                    )
+                    Text(
+                        text = "Bitte warten, Datei wird vorbereitet.",
+                        color = Color.White.copy(alpha = 0.9f),
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
                 }
             }
         }
