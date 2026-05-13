@@ -2,10 +2,13 @@ package com.example.s_browser
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.app.DownloadManager
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.view.WindowManager
@@ -34,6 +37,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -76,8 +80,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.charset.StandardCharsets
 
 /** MIME type hint for [Intent.ACTION_CREATE_DOCUMENT] from a download file name. */
 private fun mimeTypeForFileName(fileName: String): String {
@@ -239,6 +245,119 @@ private fun cleanupStagedDownloads(context: Context, exclude: String? = null) {
     } catch (_: Exception) { }
 }
 
+private data class DownloadManagerRow(val status: Int, val title: String)
+
+private fun queryDownloadManagerRow(dm: DownloadManager, id: Long): DownloadManagerRow? {
+    return try {
+        dm.query(DownloadManager.Query().setFilterById(id))?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+            val titleIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
+            val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else -1
+            val title = if (titleIdx >= 0) (cursor.getString(titleIdx) ?: "download") else "download"
+            DownloadManagerRow(status, title)
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/**
+ * WebView may pass relative URLs; DownloadManager and [CookieManager.getCookie] need absolute URLs.
+ */
+private fun resolveShopDownloadUrl(link: String, pageUrl: String?, fallbackBase: String): String {
+    val t = link.trim()
+    if (t.startsWith("http://", ignoreCase = true) || t.startsWith("https://", ignoreCase = true)) {
+        return t
+    }
+    val base = pageUrl?.takeIf { it.isNotBlank() } ?: fallbackBase
+    return try {
+        URL(URL(base), t).toString()
+    } catch (_: Exception) {
+        try {
+            URL(URL(fallbackBase), t).toString()
+        } catch (_: Exception) {
+            t
+        }
+    }
+}
+
+private fun assertPdfMagicOrThrow(file: java.io.File) {
+    if (!file.name.endsWith(".pdf", ignoreCase = true)) return
+    file.inputStream().use { ins ->
+        val head = ByteArray(5)
+        val n = ins.read(head)
+        if (n < 5 || !String(head, StandardCharsets.US_ASCII).startsWith("%PDF-")) {
+            throw IOException("Kein gültiges PDF (z. B. abgelaufene Anmeldung).")
+        }
+    }
+}
+
+/**
+ * Same-process GET so the WebView cookie store is honored (admin PDFs need the session cookie).
+ * [DownloadManager] does not always mirror WebView cookies / redirects the same way on all devices.
+ */
+private suspend fun downloadThroughWebViewCookieStore(
+    absoluteUrl: String,
+    referer: String?,
+    userAgent: String?,
+    destination: java.io.File,
+) = withContext(Dispatchers.IO) {
+    val cm = CookieManager.getInstance()
+    cm.setAcceptCookie(true)
+    cm.flush()
+    var currentUrl = absoluteUrl
+    var redirects = 0
+    while (redirects++ < 24) {
+        val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            instanceFollowRedirects = false
+            connectTimeout = 25_000
+            readTimeout = 180_000
+            useCaches = false
+            if (!userAgent.isNullOrBlank()) setRequestProperty("User-Agent", userAgent)
+            val cookie = cm.getCookie(currentUrl)
+            if (!cookie.isNullOrBlank()) setRequestProperty("Cookie", cookie)
+            if (!referer.isNullOrBlank()) setRequestProperty("Referer", referer)
+            setRequestProperty("Accept", "*/*")
+        }
+        try {
+            when (val code = conn.responseCode) {
+                HttpURLConnection.HTTP_OK -> {
+                    conn.inputStream.use { input ->
+                        destination.outputStream().use { output ->
+                            input.copyTo(output, bufferSize = 256 * 1024)
+                        }
+                    }
+                    if (destination.length() == 0L) {
+                        throw IOException("Leere Antwort vom Server.")
+                    }
+                    return@withContext
+                }
+                in 300..399 -> {
+                    val loc = conn.getHeaderField("Location")
+                        ?: throw IOException("Umleitung ohne Ziel (HTTP $code).")
+                    currentUrl = try {
+                        URL(URL(currentUrl), loc).toString()
+                    } catch (_: Exception) {
+                        loc
+                    }
+                }
+                else -> {
+                    val snippet = conn.errorStream?.bufferedReader()?.use { it.readText() }?.trim()
+                        ?.take(240)
+                    throw IOException(
+                        "HTTP $code" + if (!snippet.isNullOrBlank()) ": $snippet" else ""
+                    )
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+    throw IOException("Zu viele HTTP-Umleitungen.")
+}
+
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
 fun ShopWebView(
@@ -272,6 +391,7 @@ fun ShopWebView(
     // Persistent Settings & Tracking
     var savedAdminPin by remember(context) { mutableStateOf(loadAdminPin(context)) }
     var configuredUrl by remember(context) { mutableStateOf(loadServerUrl(context, url)) }
+    val configuredUrlRef = rememberUpdatedState(configuredUrl)
     var downloadActionFileName by remember { mutableStateOf("") }
     
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
@@ -315,6 +435,88 @@ fun ShopWebView(
     val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
     val currentAllowedHosts by rememberUpdatedState(allowedHosts)
     val scope = rememberCoroutineScope()
+    val dm = remember(context) {
+        context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    }
+
+    fun applyPendingDownloadRow(dlId: Long, row: DownloadManagerRow): Boolean {
+        if (pendingDownloadIdState.longValue != dlId) return false
+        pendingDownloadIdState.longValue = -1L
+        showDownloadProgressOverlay = false
+        when (row.status) {
+            DownloadManager.STATUS_SUCCESSFUL -> {
+                val srcUri = dm.getUriForDownloadedFile(dlId)
+                val title = row.title
+                if (srcUri != null) {
+                    cleanupStagedDownloads(context, exclude = title)
+                    pendingDownloadSaveSource = srcUri
+                    downloadActionFileName = title
+                    showDownloadActionDialog = true
+                } else {
+                    Toast.makeText(
+                        context,
+                        "Download-Datei nicht verfügbar.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            DownloadManager.STATUS_FAILED -> {
+                Toast.makeText(context, "Download fehlgeschlagen.", Toast.LENGTH_LONG).show()
+            }
+            else -> { }
+        }
+        return true
+    }
+
+    suspend fun resolvePendingDownloadByQuery(dlId: Long) {
+        repeat(25) {
+            val row = queryDownloadManagerRow(dm, dlId)
+            if (row != null &&
+                (row.status == DownloadManager.STATUS_SUCCESSFUL ||
+                    row.status == DownloadManager.STATUS_FAILED)
+            ) {
+                applyPendingDownloadRow(dlId, row)
+                return
+            }
+            delay(150)
+        }
+        if (pendingDownloadIdState.longValue == dlId) {
+            pendingDownloadIdState.longValue = -1L
+            showDownloadProgressOverlay = false
+            Toast.makeText(
+                context,
+                "Download-Status konnte nicht ermittelt werden.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (DownloadManager.ACTION_DOWNLOAD_COMPLETE != intent?.action) return
+                val dlId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                if (dlId < 0L) return
+                if (pendingDownloadIdState.longValue != dlId) return
+                scope.launch {
+                    resolvePendingDownloadByQuery(dlId)
+                }
+            }
+        }
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     val saveDownloadToLauncher = rememberLauncherForActivityResult(CreateDocumentWithMime()) { destUri ->
         val src = pendingDownloadSaveSource
@@ -344,44 +546,56 @@ fun ShopWebView(
         }
     }
 
-    // Reliable completion check for the most recent app-started download.
+    // Poll DownloadManager as a fallback; primary completion is ACTION_DOWNLOAD_COMPLETE.
     LaunchedEffect(pendingDownloadIdState.longValue) {
         val id = pendingDownloadIdState.longValue
         if (id <= 0L) return@LaunchedEffect
-        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        var ticks = 0
+        var emptyRowStreak = 0
         while (true) {
+            ticks++
+            if (ticks > 420) {
+                if (pendingDownloadIdState.longValue == id) {
+                    pendingDownloadIdState.longValue = -1L
+                    showDownloadProgressOverlay = false
+                    Toast.makeText(
+                        context,
+                        "Download dauerte zu lange.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                return@LaunchedEffect
+            }
             try {
-                val query = DownloadManager.Query().setFilterById(id)
-                dm.query(query).use { cursor ->
-                    if (cursor != null && cursor.moveToFirst()) {
-                        val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-                        val titleIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
-                        val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else -1
-                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
-                            val srcUri = dm.getUriForDownloadedFile(id)
-                            val title =
-                                if (titleIdx >= 0) cursor.getString(titleIdx) ?: "download" else "download"
-                            if (srcUri != null) {
-                                // Clean up all older files before showing the new one
-                                cleanupStagedDownloads(context, exclude = title)
-                                pendingDownloadSaveSource = srcUri
-                                downloadActionFileName = title
-                                showDownloadActionDialog = true
-                            }
-                            showDownloadProgressOverlay = false
+                val row = queryDownloadManagerRow(dm, id)
+                if (row == null) {
+                    emptyRowStreak++
+                    if (emptyRowStreak > 45) {
+                        if (pendingDownloadIdState.longValue == id) {
                             pendingDownloadIdState.longValue = -1L
-                            return@LaunchedEffect
-                        }
-                        if (status == DownloadManager.STATUS_FAILED) {
                             showDownloadProgressOverlay = false
-                            pendingDownloadIdState.longValue = -1L
-                            return@LaunchedEffect
+                            Toast.makeText(
+                                context,
+                                "Download nicht in der Download-Verwaltung gefunden.",
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
+                        return@LaunchedEffect
+                    }
+                } else {
+                    emptyRowStreak = 0
+                    if (row.status == DownloadManager.STATUS_SUCCESSFUL ||
+                        row.status == DownloadManager.STATUS_FAILED
+                    ) {
+                        applyPendingDownloadRow(id, row)
+                        return@LaunchedEffect
                     }
                 }
             } catch (_: Exception) {
-                showDownloadProgressOverlay = false
-                pendingDownloadIdState.longValue = -1L
+                if (pendingDownloadIdState.longValue == id) {
+                    pendingDownloadIdState.longValue = -1L
+                    showDownloadProgressOverlay = false
+                }
                 return@LaunchedEffect
             }
             delay(1000)
@@ -405,8 +619,8 @@ fun ShopWebView(
     Box(modifier = modifier.fillMaxSize().background(portalBg)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { context ->
-                WebView(context).apply {
+            factory = { androidCtx ->
+                WebView(androidCtx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     // Kiosk app runs fixed full-screen content; disabling overview/wide viewport
@@ -486,51 +700,78 @@ fun ShopWebView(
                             }
                         }
                     }
+                    val shopWebView = this
                     setDownloadListener { dlUrl, userAgent, contentDisposition, mimeType, _ ->
-                        try {
-                            val req = DownloadManager.Request(dlUrl.toUri())
-                            val cookies = CookieManager.getInstance().getCookie(dlUrl)
-                            if (!cookies.isNullOrBlank()) {
-                                req.addRequestHeader("Cookie", cookies)
-                            }
-                            if (!userAgent.isNullOrBlank()) {
-                                req.addRequestHeader("User-Agent", userAgent)
-                            }
-                            val fileName =
-                                URLUtil.guessFileName(dlUrl, contentDisposition, mimeType)
-                            req.setTitle(fileName)
-                            req.setDescription("Shopkasse Download")
-                            req.setNotificationVisibility(
-                                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
-                            )
-                            if (context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) != null) {
-                                req.setDestinationInExternalFilesDir(
-                                    context,
-                                    Environment.DIRECTORY_DOWNLOADS,
-                                    fileName
-                                )
-                            } else {
-                                req.setDestinationInExternalPublicDir(
-                                    Environment.DIRECTORY_DOWNLOADS,
-                                    fileName
-                                )
-                            }
-                            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                            val id = dm.enqueue(req)
+                        scope.launch {
+                            var destFile: java.io.File? = null
                             showDownloadProgressOverlay = true
-                            pendingDownloadIdState.longValue = id
-                            Toast.makeText(context, "Download gestartet: $fileName", Toast.LENGTH_SHORT).show()
-                        } catch (_: Exception) {
-                            showDownloadProgressOverlay = false
                             try {
-                                val i = Intent(Intent.ACTION_VIEW, dlUrl.toUri())
-                                context.startActivity(i)
-                            } catch (_: Exception) {
-                                Toast.makeText(context, "Download fehlgeschlagen.", Toast.LENGTH_SHORT).show()
+                                CookieManager.getInstance().setAcceptCookie(true)
+                                CookieManager.getInstance().flush()
+                                val resolved = resolveShopDownloadUrl(
+                                    dlUrl,
+                                    shopWebView.url,
+                                    configuredUrlRef.value,
+                                )
+                                val fileName =
+                                    URLUtil.guessFileName(resolved, contentDisposition, mimeType)
+                                val dir =
+                                    androidCtx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                                if (dir == null) {
+                                    Toast.makeText(
+                                        androidCtx,
+                                        "Speicher nicht verfügbar.",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                    return@launch
+                                }
+                                val outFile = java.io.File(dir, fileName)
+                                destFile = outFile
+                                val referer = shopWebView.url?.takeIf { it.isNotBlank() }
+                                    ?: configuredUrlRef.value
+                                val ua = userAgent?.takeIf { it.isNotBlank() }
+                                    ?: shopWebView.settings.userAgentString
+                                downloadThroughWebViewCookieStore(
+                                    resolved,
+                                    referer,
+                                    ua,
+                                    outFile,
+                                )
+                                assertPdfMagicOrThrow(outFile)
+                                cleanupStagedDownloads(androidCtx, exclude = fileName)
+                                pendingDownloadSaveSource = FileProvider.getUriForFile(
+                                    androidCtx,
+                                    "${androidCtx.packageName}.fileprovider",
+                                    outFile,
+                                )
+                                downloadActionFileName = fileName
+                                showDownloadActionDialog = true
+                                Toast.makeText(
+                                    androidCtx,
+                                    "Download bereit: $fileName",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            } catch (e: Exception) {
+                                try {
+                                    destFile?.delete()
+                                } catch (_: Exception) {
+                                }
+                                val msg = (e as? IOException)?.message ?: e.message
+                                Toast.makeText(
+                                    androidCtx,
+                                    if (!msg.isNullOrBlank()) {
+                                        "Download fehlgeschlagen: $msg"
+                                    } else {
+                                        "Download fehlgeschlagen."
+                                    },
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } finally {
+                                showDownloadProgressOverlay = false
                             }
                         }
                     }
-                    loadUrl(configuredUrl)
+                    loadUrl(configuredUrlRef.value)
                 }
             },
             onRelease = { webView ->
