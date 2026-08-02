@@ -58,3 +58,5 @@ Typische URL:
 
 - Die App ist für den Betrieb mit der Termux-Shopkasse ausgelegt.
 - Für Auto-Start des Backends nach Reboot: im Backend-Repo die Anleitung zu `Termux:Boot` nutzen.
+- Die App hält die WebView periodisch wach (JS-/Server-Check jede Minute) und weckt sie bei `onResume` erneut auf. Das soll Einfrieren auf OEM-Tablets (z. B. Lenovo) abfangen, ohne Fake-Touches und ohne die Idle-Logik der Shopkasse zu stören.
+- Im Admin-Menü kann die Akku-Optimierung für die App deaktiviert werden, um sicherzustellen, dass Android die App im Hintergrund (bzw. bei Inaktivität) nicht drosselt oder beendet.

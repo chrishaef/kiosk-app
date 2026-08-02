@@ -2,15 +2,13 @@ package com.example.s_browser
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.app.DownloadManager
 import android.content.Intent
-import android.content.IntentFilter
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
@@ -41,7 +39,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -49,6 +46,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -65,6 +63,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -79,11 +79,18 @@ import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull as withCoroutinesTimeoutOrNull
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import kotlin.coroutines.resume
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /** MIME type hint for [Intent.ACTION_CREATE_DOCUMENT] from a download file name. */
 private fun mimeTypeForFileName(fileName: String): String {
@@ -155,6 +162,62 @@ private fun applyShopWebViewColorPolicy(settings: WebSettings) {
     }
     if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
         WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false)
+    }
+}
+
+/** Interval for kiosk keep-alive against frozen WebView/renderer on OEM tablets. */
+private val KIOSK_KEEP_ALIVE_INTERVAL = 1.minutes
+private val KIOSK_KEEP_ALIVE_JS_TIMEOUT = 2500.milliseconds
+private const val KIOSK_KEEP_ALIVE_HTTP_TIMEOUT_MS = 2500
+
+/** Lightweight local probe; used to decide soft-reload vs. error overlay. */
+private fun probeShopServer(baseUrl: String): Boolean {
+    var conn: HttpURLConnection? = null
+    return try {
+        val probeUrl = baseUrl.trim().trimEnd('/') + "/"
+        conn = (URL(probeUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            instanceFollowRedirects = true
+            connectTimeout = KIOSK_KEEP_ALIVE_HTTP_TIMEOUT_MS
+            readTimeout = KIOSK_KEEP_ALIVE_HTTP_TIMEOUT_MS
+            useCaches = false
+        }
+        conn.responseCode in 200..399
+    } catch (_: Exception) {
+        false
+    } finally {
+        conn?.disconnect()
+    }
+}
+
+private suspend fun webViewJsAlive(
+    webView: WebView,
+    timeout: Duration = KIOSK_KEEP_ALIVE_JS_TIMEOUT,
+): Boolean {
+    return withCoroutinesTimeoutOrNull(timeout) {
+        suspendCancellableCoroutine { cont ->
+            webView.post {
+                try {
+                    webView.evaluateJavascript("(function(){return 'ok';})();") { result ->
+                        if (cont.isActive) {
+                            cont.resume(value = result != null && result.contains("ok"))
+                        }
+                    }
+                } catch (_: Exception) {
+                    if (cont.isActive) cont.resume(value = false)
+                }
+            }
+        }
+    } ?: false
+}
+
+private fun wakeWebView(webView: WebView?) {
+    webView ?: return
+    try {
+        webView.onResume()
+        webView.resumeTimers()
+    } catch (_: Exception) {
+        // Ignore OEM/WebView edge cases.
     }
 }
 
@@ -245,23 +308,6 @@ private fun cleanupStagedDownloads(context: Context, exclude: String? = null) {
     } catch (_: Exception) { }
 }
 
-private data class DownloadManagerRow(val status: Int, val title: String)
-
-private fun queryDownloadManagerRow(dm: DownloadManager, id: Long): DownloadManagerRow? {
-    return try {
-        dm.query(DownloadManager.Query().setFilterById(id))?.use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            val statusIdx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-            val titleIdx = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
-            val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else -1
-            val title = if (titleIdx >= 0) (cursor.getString(titleIdx) ?: "download") else "download"
-            DownloadManagerRow(status, title)
-        }
-    } catch (_: Exception) {
-        null
-    }
-}
-
 /**
  * WebView may pass relative URLs; DownloadManager and [CookieManager.getCookie] need absolute URLs.
  */
@@ -295,7 +341,7 @@ private fun assertPdfMagicOrThrow(file: java.io.File) {
 
 /**
  * Same-process GET so the WebView cookie store is honored (admin PDFs need the session cookie).
- * [DownloadManager] does not always mirror WebView cookies / redirects the same way on all devices.
+ * Der Standard-DownloadManager spiegelt WebView-Cookies / Redirects nicht immer zuverlässig.
  */
 private suspend fun downloadThroughWebViewCookieStore(
     absoluteUrl: String,
@@ -395,7 +441,6 @@ fun ShopWebView(
     var downloadActionFileName by remember { mutableStateOf("") }
     
     var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
-    val pendingDownloadIdState = remember { mutableLongStateOf(-1L) }
     var pendingDownloadSaveSource by remember { mutableStateOf<Uri?>(null) }
 
     // Kiosk-style: Back is completely disabled to prevent re-entering restricted areas.
@@ -435,88 +480,6 @@ fun ShopWebView(
     val adminPinRef = rememberUpdatedState(newValue = savedAdminPin)
     val currentAllowedHosts by rememberUpdatedState(allowedHosts)
     val scope = rememberCoroutineScope()
-    val dm = remember(context) {
-        context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    }
-
-    fun applyPendingDownloadRow(dlId: Long, row: DownloadManagerRow): Boolean {
-        if (pendingDownloadIdState.longValue != dlId) return false
-        pendingDownloadIdState.longValue = -1L
-        showDownloadProgressOverlay = false
-        when (row.status) {
-            DownloadManager.STATUS_SUCCESSFUL -> {
-                val srcUri = dm.getUriForDownloadedFile(dlId)
-                val title = row.title
-                if (srcUri != null) {
-                    cleanupStagedDownloads(context, exclude = title)
-                    pendingDownloadSaveSource = srcUri
-                    downloadActionFileName = title
-                    showDownloadActionDialog = true
-                } else {
-                    Toast.makeText(
-                        context,
-                        "Download-Datei nicht verfügbar.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-            DownloadManager.STATUS_FAILED -> {
-                Toast.makeText(context, "Download fehlgeschlagen.", Toast.LENGTH_LONG).show()
-            }
-            else -> { }
-        }
-        return true
-    }
-
-    suspend fun resolvePendingDownloadByQuery(dlId: Long) {
-        repeat(25) {
-            val row = queryDownloadManagerRow(dm, dlId)
-            if (row != null &&
-                (row.status == DownloadManager.STATUS_SUCCESSFUL ||
-                    row.status == DownloadManager.STATUS_FAILED)
-            ) {
-                applyPendingDownloadRow(dlId, row)
-                return
-            }
-            delay(150)
-        }
-        if (pendingDownloadIdState.longValue == dlId) {
-            pendingDownloadIdState.longValue = -1L
-            showDownloadProgressOverlay = false
-            Toast.makeText(
-                context,
-                "Download-Status konnte nicht ermittelt werden.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    @SuppressLint("UnspecifiedRegisterReceiverFlag")
-    DisposableEffect(context) {
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                if (DownloadManager.ACTION_DOWNLOAD_COMPLETE != intent?.action) return
-                val dlId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-                if (dlId < 0L) return
-                if (pendingDownloadIdState.longValue != dlId) return
-                scope.launch {
-                    resolvePendingDownloadByQuery(dlId)
-                }
-            }
-        }
-        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(receiver, filter)
-        }
-        onDispose {
-            try {
-                context.unregisterReceiver(receiver)
-            } catch (_: Exception) {
-            }
-        }
-    }
 
     val saveDownloadToLauncher = rememberLauncherForActivityResult(CreateDocumentWithMime()) { destUri ->
         val src = pendingDownloadSaveSource
@@ -546,69 +509,71 @@ fun ShopWebView(
         }
     }
 
-    // Poll DownloadManager as a fallback; primary completion is ACTION_DOWNLOAD_COMPLETE.
-    LaunchedEffect(pendingDownloadIdState.longValue) {
-        val id = pendingDownloadIdState.longValue
-        if (id <= 0L) return@LaunchedEffect
-        var ticks = 0
-        var emptyRowStreak = 0
-        while (true) {
-            ticks++
-            if (ticks > 420) {
-                if (pendingDownloadIdState.longValue == id) {
-                    pendingDownloadIdState.longValue = -1L
-                    showDownloadProgressOverlay = false
-                    Toast.makeText(
-                        context,
-                        "Download dauerte zu lange.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-                return@LaunchedEffect
-            }
-            try {
-                val row = queryDownloadManagerRow(dm, id)
-                if (row == null) {
-                    emptyRowStreak++
-                    if (emptyRowStreak > 45) {
-                        if (pendingDownloadIdState.longValue == id) {
-                            pendingDownloadIdState.longValue = -1L
-                            showDownloadProgressOverlay = false
-                            Toast.makeText(
-                                context,
-                                "Download nicht in der Download-Verwaltung gefunden.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                        return@LaunchedEffect
-                    }
-                } else {
-                    emptyRowStreak = 0
-                    if (row.status == DownloadManager.STATUS_SUCCESSFUL ||
-                        row.status == DownloadManager.STATUS_FAILED
-                    ) {
-                        applyPendingDownloadRow(id, row)
-                        return@LaunchedEffect
-                    }
-                }
-            } catch (_: Exception) {
-                if (pendingDownloadIdState.longValue == id) {
-                    pendingDownloadIdState.longValue = -1L
-                    showDownloadProgressOverlay = false
-                }
-                return@LaunchedEffect
-            }
-            delay(1000)
-        }
-    }
     // Auto-retry after 3s whenever we are in error state.
     LaunchedEffect(hasError, retryTickState.intValue) {
         if (hasError && retryTickState.intValue > 0) {
             webViewRef?.loadUrl(configuredUrl)
         }
         if (hasError) {
-            delay(3000)
+            delay(3.seconds)
             retryTickState.intValue += 1
+        }
+    }
+
+    // Keep WebView timers/renderer alive across brief Activity pauses (e.g. screen toggle).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, webViewRef) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> wakeWebView(webViewRef)
+                Lifecycle.Event.ON_PAUSE -> {
+                    // Do not pauseTimers() in kiosk mode: OEM devices may freeze JS/renderer.
+                    try {
+                        webViewRef?.onPause()
+                    } catch (_: Exception) {
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Periodic keep-alive: detect frozen WebView without fake touches / without resetting shop idle.
+    LaunchedEffect(webViewRef, configuredUrl) {
+        while (true) {
+            delay(KIOSK_KEEP_ALIVE_INTERVAL)
+            val wv = webViewRef ?: continue
+            if (hasError) continue
+            if (
+                showPinDialog ||
+                showPinSetupDialog ||
+                showPinChangeDialog ||
+                showExitConfirmDialog ||
+                showMinimizeConfirmDialog ||
+                showServerUrlDialog ||
+                showAdminMenu ||
+                showGoHomeConfirmDialog ||
+                showDownloadActionDialog ||
+                showDownloadProgressOverlay
+            ) {
+                continue
+            }
+
+            wakeWebView(wv)
+            val jsAlive = webViewJsAlive(wv)
+            if (jsAlive) continue
+
+            val serverOk = withContext(Dispatchers.IO) { probeShopServer(configuredUrl) }
+            if (serverOk) {
+                // Renderer/JS frozen while backend is reachable: soft reload.
+                wv.post { wv.reload() }
+            } else {
+                hasError = true
+            }
         }
     }
 
@@ -631,7 +596,7 @@ fun ShopWebView(
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
                     
                     // Prevent native long-press link previews
-                    // stealing kiosk long-press gestures (easter egg/admin trigger).
+                    // stealing kiosk long-press gestures (admin trigger).
                     isLongClickable = false
                     setOnLongClickListener { true }
                     isHapticFeedbackEnabled = false
@@ -852,10 +817,11 @@ fun ShopWebView(
                 .pointerInput(adminPinRef.value) {
                     awaitEachGesture {
                         awaitFirstDown()
-                        val timer = withTimeoutOrNull(5000L) {
+                        // Member of AwaitPointerEventScope (not kotlinx.coroutines).
+                        val releasedBeforeTimeout = withTimeoutOrNull(5_000L) {
                             waitForUpOrCancellation()
                         }
-                        if (timer == null) {
+                        if (releasedBeforeTimeout == null) {
                             if (adminPinRef.value.isNullOrBlank()) {
                                 showPinSetupDialog = true
                             } else {
@@ -911,6 +877,21 @@ fun ShopWebView(
                 onMinimize = { showMinimizeConfirmDialog = true },
                 onGoHome = { showGoHomeConfirmDialog = true },
                 onChangePin = { showPinChangeDialog = true },
+                onOpenBatterySettings = {
+                    try {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = "package:${context.packageName}".toUri()
+                        }
+                        context.startActivity(intent)
+                    } catch (_: Exception) {
+                        try {
+                            val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            context.startActivity(intent)
+                        } catch (_: Exception) {
+                            Toast.makeText(context, "Einstellungen konnten nicht geöffnet werden.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
                 onExit = { showExitConfirmDialog = true }
             )
         }
@@ -1130,8 +1111,15 @@ fun AdminMenuDialog(
     onMinimize: () -> Unit,
     onGoHome: () -> Unit,
     onChangePin: () -> Unit,
+    onOpenBatterySettings: () -> Unit,
     onExit: () -> Unit
 ) {
+    val context = LocalContext.current
+    val isIgnoringBattery = remember { 
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        pm.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Admin-Bereich") },
@@ -1139,6 +1127,14 @@ fun AdminMenuDialog(
             Column(modifier = Modifier.fillMaxWidth()) {
                 AdminMenuButton("Server neu laden", onClick = { onDismiss(); onReload() })
                 AdminMenuButton("Server-Adresse ändern", onClick = { onDismiss(); onChangeUrl() })
+                
+                if (!isIgnoringBattery) {
+                    AdminMenuButton(
+                        text = "Akku-Optimierung deaktivieren",
+                        onClick = { onDismiss(); onOpenBatterySettings() }
+                    )
+                }
+
                 AdminMenuButton("Minimieren", onClick = { onDismiss(); onMinimize() })
                 AdminMenuButton("App verlassen", onClick = { onDismiss(); onGoHome() })
                 AdminMenuButton("PIN ändern", onClick = { onDismiss(); onChangePin() })
